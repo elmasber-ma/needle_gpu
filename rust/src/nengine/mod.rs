@@ -1148,7 +1148,7 @@ pub fn parity(query: &str) -> Result<String, String> {
         g.as_ref().ok_or("motor GPU no cargado")?.cact_path.clone()
     };
     use needle_infer::v2_engine::{GenerateOptions, V2Engine};
-    let cpu = V2Engine::load(std::path::Path::new(cact_path))
+    let cpu = V2Engine::load(&cact_path)
         .map_err(|e| format!("cpu load: {e}"))?;
     let opts = GenerateOptions {
         max_new_tokens: 8,
