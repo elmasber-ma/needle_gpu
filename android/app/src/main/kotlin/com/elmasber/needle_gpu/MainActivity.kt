@@ -3,9 +3,9 @@ package com.elmasber.needle_gpu
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
-import com.ryanheise.audioservice.AudioServiceActivity
+import io.flutter.embedding.android.FlutterActivity
 
-class MainActivity : AudioServiceActivity() {
+class MainActivity : FlutterActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Dibujar también en la zona del notch/punch-hole (evita franja negra)
