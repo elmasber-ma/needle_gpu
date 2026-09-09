@@ -1011,12 +1011,57 @@ pub struct GenOut {
     pub generated_tokens: u32,
 }
 
+/// Un solo paso cronometrado (diagnóstico: cuelga vs lento).
+/// Devuelve "step_ms=.. · vocab=.. · capas=..". No toca el historial.
+pub fn diag_step() -> Result<String, String> {
+    let g = ENG
+        .lock()
+        .map_err(|_| "mutex envenenado".to_string())?;
+    let eng = g.as_ref().ok_or("motor GPU no cargado")?;
+    let t0 = std::time::Instant::now();
+    let logits = step_token(eng, 2, 0)?;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let top = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    Ok(format!(
+        "step_ms={ms:.1} · vocab={} · capas={} · top={top}",
+        eng.vocab, eng.n_layers
+    ))
+}
+
 pub fn generate(
     query: &str,
     tools_json: &str,
     max_new_tokens: u32,
     temperature: f32,
     seed: u64,
+) -> Result<GenOut, String> {
+    let mut sink = |_: String| {};
+    generate_inner(query, tools_json, max_new_tokens, temperature, seed, &mut sink)
+}
+
+pub fn generate_stream(
+    query: &str,
+    tools_json: &str,
+    max_new_tokens: u32,
+    temperature: f32,
+    seed: u64,
+    emit: &mut dyn FnMut(String),
+) -> Result<GenOut, String> {
+    generate_inner(query, tools_json, max_new_tokens, temperature, seed, emit)
+}
+
+fn generate_inner(
+    query: &str,
+    tools_json: &str,
+    max_new_tokens: u32,
+    temperature: f32,
+    seed: u64,
+    emit: &mut dyn FnMut(String),
 ) -> Result<GenOut, String> {
     let mut g = ENG
         .lock()
@@ -1057,6 +1102,7 @@ pub fn generate(
         let id = sample(&logits, temperature, &mut rng);
         gen.push(id);
         eng.hist.push(id);
+        emit(eng.tok.decode(&[id]));
         if id == eng.eos_id {
             stop = "eos";
             break;

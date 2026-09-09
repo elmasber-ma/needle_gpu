@@ -48,17 +48,48 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
       _ctrl.clear();
       _busy = true;
     });
+    if (_gpu) {
+      // GPU en vivo: cada pieza se pinta al llegar (si se cuelga, se ve
+      // exactamente dónde: sin piezas = trabado en prefill/paso).
+      final buf = StringBuffer();
+      setState(() => _msgs.add(_Msg(false, '', 'GPU · generando…')));
+      final sw = Stopwatch()..start();
+      try {
+        await for (final piece in _svc.runGpuStream(
+            query: q, toolsJson: '[]', maxNewTokens: 256)) {
+          buf.write(piece);
+          if (mounted) {
+            setState(() =>
+                _msgs[_msgs.length - 1] = _Msg(false, buf.toString(), 'GPU · generando…'));
+          }
+        }
+        sw.stop();
+        final ms = sw.elapsedMilliseconds;
+        final aprox = buf.length ~/ 4;
+        if (mounted) {
+          setState(() => _msgs[_msgs.length - 1] = _Msg(
+              false,
+              buf.toString().trim().isEmpty ? '(vacío)' : buf.toString().trim(),
+              'GPU · ~$aprox tok · ${ms}ms · listo'));
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() => _msgs[_msgs.length - 1] =
+              _Msg(false, buf.toString(), 'GPU ERROR: $e'));
+        }
+      } finally {
+        if (mounted) setState(() => _busy = false);
+      }
+      return;
+    }
     final sw = Stopwatch()..start();
     try {
-      final out = _gpu
-          ? await _svc.runGpu(
-              query: q, toolsJson: '[]', maxNewTokens: 256)
-          : await _svc.run(
-              query: q,
-              toolsJson: '[]',
-              constrain: false,
-              maxNewTokens: 256,
-            );
+      final out = await _svc.run(
+        query: q,
+        toolsJson: '[]',
+        constrain: false,
+        maxNewTokens: 256,
+      );
       sw.stop();
       final ms = sw.elapsedMilliseconds;
       final tps = out.generatedTokens > 0 && ms > 0
@@ -67,7 +98,7 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
       final texto = out.text.trim().isEmpty ? '(vacío)' : out.text.trim();
       if (mounted) {
         setState(() => _msgs.add(_Msg(false, texto,
-            '${_gpu ? "GPU" : "CPU"} · tok ${out.promptTokens}+${out.generatedTokens} · ${ms}ms · $tps tok/s · ${out.stop}')));
+            'CPU · tok ${out.promptTokens}+${out.generatedTokens} · ${ms}ms · $tps tok/s · ${out.stop}')));
       }
     } catch (e) {
       if (mounted) setState(() => _msgs.add(_Msg(false, 'ERROR: $e')));
@@ -144,6 +175,32 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
                     },
                     icon: const Icon(Icons.eject_rounded, size: 18),
                     label: const Text('Liberar GPU',
+                        style: TextStyle(fontSize: 12)),
+                  ),
+                if (_svc.loadedGpu)
+                  OutlinedButton.icon(
+                    onPressed: _busy
+                        ? null
+                        : () async {
+                            setState(() => _busy = true);
+                            try {
+                              final r = await _svc.gpuDiag();
+                              if (mounted) {
+                                setState(() =>
+                                    _msgs.add(_Msg(false, r, 'GPU diag')));
+                              }
+                            } catch (e) {
+                              if (mounted) {
+                                setState(() => _msgs.add(
+                                    _Msg(false, 'DIAG ERROR: $e')));
+                              }
+                            } finally {
+                              if (mounted) setState(() => _busy = false);
+                            }
+                          },
+                    icon: const Icon(Icons.monitor_heart_rounded,
+                        size: 18),
+                    label: const Text('Diag 1 paso',
                         style: TextStyle(fontSize: 12)),
                   ),
               ],

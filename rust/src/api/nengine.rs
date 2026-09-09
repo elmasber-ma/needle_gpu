@@ -26,6 +26,29 @@ pub fn needle_gpu_is_loaded() -> bool {
     nengine::is_loaded()
 }
 
+/// Diagnóstico: un solo paso cronometrado (cuelgue vs lentitud).
+#[flutter_rust_bridge::frb(sync)]
+pub fn needle_gpu_diag() -> Result<String, String> {
+    nengine::diag_step()
+}
+
+/// Genera con el forward en GPU, emitiendo cada pieza en vivo.
+/// Sin constrain en fase 1.
+#[flutter_rust_bridge::frb]
+pub fn needle_gpu_run_stream(
+    query: String,
+    tools_json: String,
+    max_new_tokens: u32,
+    temperature: f32,
+    seed: u64,
+    sink: flutter_rust_bridge::StreamSink<String>,
+) -> Result<(), String> {
+    nengine::generate_stream(&query, &tools_json, max_new_tokens, temperature, seed, &mut |piece| {
+        let _ = sink.add(piece);
+    })?;
+    Ok(())
+}
+
 /// Genera con el forward en GPU. Sin constrain en fase 1.
 #[flutter_rust_bridge::frb(sync)]
 pub fn needle_gpu_run(
