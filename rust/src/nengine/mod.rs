@@ -47,8 +47,9 @@ fn f32s(v: &[f32]) -> Vec<u8> {
 
 /// Peso de matmul: o matriz f32 subida, o peso CQ empaquetado
 /// (mismos bytes del .cact, desempaquetado al vuelo en el shader).
+/// `idx`/`rs` = récord .cact y fila inicial (para referencia CPU en diag).
 enum Wmat {
-    F32(wgpu::Buffer),
+    F32 { b: wgpu::Buffer, idx: usize, rs: usize },
     Cq(CqUp),
 }
 
@@ -60,6 +61,8 @@ struct CqUp {
     bits: u32,
     row_u32: u32,
     ngroups: u32,
+    idx: usize,
+    rs: usize,
     group: u32,
     in_padded: u32,
     out_feat: u32,
@@ -468,7 +471,11 @@ fn load_wmat(
         } else {
             v[..exp_out * exp_in].to_vec()
         };
-        return Ok(Wmat::F32(sbuf(device, &f32s(&band))));
+        return Ok(Wmat::F32 {
+            b: sbuf(device, &f32s(&band)),
+            idx,
+            rs,
+        });
     }
     if rec.ndim != 2 || rec.shape.len() < 2 {
         return Err(format!("tensor {etiqueta} no 2-D"));
@@ -540,6 +547,8 @@ fn load_wmat(
         bits: bits as u32,
         row_u32: (row_bytes / 4) as u32,
         ngroups: ngroups as u32,
+        idx,
+        rs,
         group: group as u32,
         in_padded: in_padded as u32,
         out_feat: rows as u32,
@@ -915,7 +924,7 @@ impl Engine {
         in_feat: u32,
     ) {
         match w {
-            Wmat::F32(b) => self.matvec(enc, y, b, x, rows, in_feat),
+            Wmat::F32 { b, .. } => self.matvec(enc, y, b, x, rows, in_feat),
             Wmat::Cq(c) => {
                 let mut v = Vec::with_capacity(32);
                 v.extend_from_slice(&rows.to_le_bytes());
@@ -1220,6 +1229,129 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
     Ok(out)
 }
 
+// --------------------------------------- barrido por proyección (diag CQ)
+
+// Una proyección GPU vs pesos reales: entrada determinista, prepare+proj en
+// GPU, matvec f32 ingenuo en CPU. Devuelve Δmax.
+fn sweep_one(
+    eng: &Engine,
+    cact: &Cact,
+    name: &str,
+    w: &Wmat,
+    rows: u32,
+    in_feat: u32,
+    x: &[f32],
+) -> Result<(String, f32), String> {
+    let (idx, rs) = match w {
+        Wmat::F32 { idx, rs, .. } => (*idx, *rs),
+        Wmat::Cq(c) => (c.idx, c.rs),
+    };
+    // referencia CPU: pesos reales × x
+    let full = get_f32(cact, idx)?;
+    let base = rs * in_feat as usize;
+    let need = base + rows as usize * in_feat as usize;
+    if need > full.len() {
+        return Err(format!("{name}: pesos cortos"));
+    }
+    let mut y_cpu = vec![0.0f32; rows as usize];
+    for o in 0..rows as usize {
+        let mut acc = 0.0f32;
+        let row = &full[base + o * in_feat as usize..base + (o + 1) * in_feat as usize];
+        for (a, b) in row.iter().zip(x.iter()) {
+            acc += a * b;
+        }
+        y_cpu[o] = acc;
+    }
+    // GPU: misma x por prepare+proj, salida a logits, readback
+    let a = &eng.act;
+    let (xbuf, xh) = if in_feat == 2048 {
+        (&a.nx, &a.xh_nx)
+    } else {
+        (&a.h, &a.xh_h)
+    };
+    eng.queue.write_buffer(xbuf, 0, &f32s(x));
+    let mut enc = eng
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    eng.prepare(&mut enc, xh, xbuf, in_feat);
+    eng.proj(&mut enc, &a.logits, w, xbuf, xh, rows, in_feat);
+    enc.copy_buffer_to_buffer(&a.logits, 0, &eng.staging, 0, (rows * 4) as u64);
+    eng.queue.submit(Some(enc.finish()));
+    let slice = eng.staging.slice(..(rows * 4) as u64);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    eng.device.poll(wgpu::PollType::wait()).expect("poll");
+    rx.recv()
+        .map_err(|_| "readback roto".to_string())?
+        .map_err(|e| format!("map: {e:?}"))?;
+    let data = slice.get_mapped_range();
+    let mut dm = 0.0f32;
+    for (i, ch) in data.chunks_exact(4).enumerate() {
+        if i >= y_cpu.len() {
+            break;
+        }
+        let v = f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+        dm = dm.max((v - y_cpu[i]).abs());
+    }
+    drop(data);
+    eng.staging.unmap();
+    Ok((name.to_string(), dm))
+}
+
+/// Corre todas las proyecciones del motor contra los pesos reales.
+/// Aísla un bug de prepare/matvec del resto del forward.
+fn sweep_all(eng: &Engine) -> Result<String, String> {
+    let cact = Cact::load(std::path::Path::new(&eng.cact_path))
+        .map_err(|e| format!("reabrir cact: {e}"))?;
+    let mut s = 0x12345678u32;
+    let mut rnd = || {
+        s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        (s >> 8) as f32 / 16777216.0 - 0.5
+    };
+    let x512: Vec<f32> = (0..512).map(|_| rnd()).collect();
+    let x2048: Vec<f32> = (0..2048).map(|_| rnd()).collect();
+    let mut worst: Vec<(String, f32)> = Vec::new();
+    let mut n = 0u32;
+    let mut gmax = 0.0f32;
+    let mut run = |name: String, w: &Wmat, rows: u32, inf: u32, x: &[f32]| -> Result<(), String> {
+        let (_, dm) = sweep_one(eng, &cact, &name, w, rows, inf, x)?;
+        n += 1;
+        gmax = gmax.max(dm);
+        if dm > 0.02 {
+            worst.push((name, dm));
+        }
+        Ok(())
+    };
+    run("emb".into(), &eng.emb, eng.vocab as u32, 512, &x512)?;
+    for li in 0..eng.n_layers {
+        let l = &eng.layers[li];
+        run(format!("q{li}"), &l.q, 512, 512, &x512)?;
+        run(format!("k{li}"), &l.k, 256, 512, &x512)?;
+        run(format!("v{li}"), &l.v, 256, 512, &x512)?;
+        run(format!("g{li}"), &l.g, 512, 512, &x512)?;
+        run(format!("o{li}"), &l.o, 512, 512, &x512)?;
+        run(format!("pp{li}"), &l.phi_pre, 4, 2048, &x2048)?;
+        run(format!("po{li}"), &l.phi_post, 4, 2048, &x2048)?;
+        run(format!("pr{li}"), &l.phi_res, 16, 2048, &x2048)?;
+    }
+    for (si, st) in eng.sites.iter().enumerate() {
+        run(format!("ek{si}"), &st.key, 512, 512, &x512)?;
+        run(format!("ev{si}"), &st.value, 512, 512, &x512)?;
+    }
+    worst.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mal: Vec<String> = worst
+        .iter()
+        .take(10)
+        .map(|(nm, dm)| format!("{nm}:{dm:.2}"))
+        .collect();
+    Ok(format!(
+        "sweep n={n} maxΔ={gmax:.5} mal=[{}]",
+        mal.join(" ")
+    ))
+}
+
 // ------------------------------------------------------------------ sampling
 
 struct SplitMix(u64);
@@ -1328,10 +1460,12 @@ pub fn diag_step() -> Result<String, String> {
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)
         .unwrap_or(0);
-    Ok(format!(
+    let step_s = format!(
         "step_ms={ms:.1} · vocab={} · capas={} · top={top}",
         eng.vocab, eng.n_layers
-    ))
+    );
+    let sw = sweep_all(eng)?;
+    Ok(format!("{step_s} · {sw}"))
 }
 
 /// IDs del prompt (diagnóstico de paridad): mismo prompt que generate.
