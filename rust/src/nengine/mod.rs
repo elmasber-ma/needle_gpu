@@ -1012,6 +1012,27 @@ pub struct GenOut {
     pub prompt_tokens: u32,
     pub generated_tokens: u32,
     pub token_ids: Vec<u32>,
+    /// (top1 id, gap top1-top2) de los primeros pasos (diagnóstico).
+    pub margins: Vec<(u32, f32)>,
+}
+
+fn top2(logits: &[f32]) -> (u32, f32, u32, f32) {
+    let mut b1 = 0u32;
+    let mut v1 = f32::NEG_INFINITY;
+    let mut b2 = 0u32;
+    let mut v2 = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > v1 {
+            v2 = v1;
+            b2 = b1;
+            v1 = v;
+            b1 = i as u32;
+        } else if v > v2 {
+            v2 = v;
+            b2 = i as u32;
+        }
+    }
+    (b1, v1, b2, v2)
 }
 
 /// Un solo paso cronometrado (diagnóstico: cuelga vs lento).
@@ -1092,6 +1113,7 @@ fn generate_inner(
     }
 
     let mut gen: Vec<u32> = Vec::new();
+    let mut margins: Vec<(u32, f32)> = Vec::new();
     let mut rng = SplitMix(seed);
     let mut stop = "max_tokens";
     while gen.len() < max_new {
@@ -1105,6 +1127,11 @@ fn generate_inner(
         let id = sample(&logits, temperature, &mut rng);
         gen.push(id);
         eng.hist.push(id);
+        if margins.len() < 8 {
+            let (t1, v1, _, v2) = top2(&logits);
+            let _ = t1;
+            margins.push((id, v1 - v2));
+        }
         emit(eng.tok.decode(&[id]));
         if id == eng.eos_id {
             stop = "eos";
@@ -1135,6 +1162,7 @@ fn generate_inner(
         prompt_tokens: ids.len() as u32,
         generated_tokens: gen.len() as u32,
         token_ids: gen,
+        margins,
     })
 }
 
@@ -1175,17 +1203,25 @@ pub fn parity(query: &str) -> Result<String, String> {
             .collect::<Vec<_>>()
             .join(",")
     };
+    let gaps = rg
+        .margins
+        .iter()
+        .map(|(id, g)| format!("{id}:{g:.3}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     match dif {
         None if rc.token_ids.len() == rg.token_ids.len() => Ok(format!(
-            "MATCH 8/8 · cpu=[{}] gpu=[{}]",
+            "MATCH 8/8 · cpu=[{}] gpu=[{}] · gaps=[{}]",
             show(&rc.token_ids),
-            show(&rg.token_ids)
+            show(&rg.token_ids),
+            gaps
         )),
         _ => Ok(format!(
-            "DIF@{} · cpu=[{}] gpu=[{}]",
+            "DIF@{} · cpu=[{}] gpu=[{}] · gaps=[{}] (gap<0.05 en el flip = ruido; gap grande = bug)",
             dif.map(|k| k.to_string()).unwrap_or("len".into()),
             show(&rc.token_ids),
-            show(&rg.token_ids)
+            show(&rg.token_ids),
+            gaps
         )),
     }
 }
