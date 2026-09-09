@@ -1,0 +1,97 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace = "com.elmasber.needle_gpu"
+    compileSdk = 36
+    ndkVersion = "27.0.12077973"
+
+    compileOptions {
+        coreLibraryDesugaringEnabled true
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17.toString()
+    }
+
+    defaultConfig {
+        applicationId = "com.elmasber.needle_gpu"
+        // 26 (Android 8): lutimes() que usa unrar_sys (RAR de unarc-rs) solo
+        // existe en bionic desde API 26; con minSdk menor el sysroot oculta
+        // el símbolo y el build nativo falla en ulinks.cpp.
+        minSdk = 26
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+        multiDexEnabled true
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            // TODO: Add your own signing config for the release build.
+            // Signing with the debug keys for now, so `flutter run --release` works.
+            signingConfig = signingConfigs.debug
+        }
+    }
+}
+
+dependencies {
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'
+}
+
+flutter {
+    source = "../.."
+}
+
+// Rust (flutter_rust_bridge/cargokit) linkea contra libc++_shared.so
+// (candle/tokenizers usan C++). Godot lo empaqueta siempre, pero Flutter no,
+// asi que copiamos libc++_shared.so desde el NDK a jniLibs para que el APK
+// lo incluya y System.loadLibrary("rust_lib_needle_gpu") no falle al iniciar.
+def ndkRoot = file("${android.sdkDirectory}/ndk/${android.ndkVersion}")
+def hostTriple = "linux-x86_64"
+
+def copyLibCxx = tasks.register("copyLibCxx") {
+    def outDir = layout.buildDirectory.dir("generated/libcxx")
+    outputs.dir(outDir)
+    doLast {
+        def abis = [
+            "arm64-v8a"    : "aarch64-linux-android",
+            "armeabi-v7a"  : "arm-linux-androideabi",
+            "x86_64"       : "x86_64-linux-android",
+            "x86"          : "i686-linux-android",
+        ]
+        abis.each { abi, triple ->
+            def from = new File(ndkRoot, "toolchains/llvm/prebuilt/${hostTriple}/sysroot/usr/lib/${triple}/libc++_shared.so")
+            def to = new File(outDir.get().asFile, "${abi}/libc++_shared.so")
+            if (from.exists()) {
+                to.parentFile.mkdirs()
+                to.bytes = from.bytes
+                logger.lifecycle("libc++_shared.so: ${abi} copiada")
+            } else {
+                logger.warn("libc++_shared.so: NO existe para ${abi} en ${from}")
+            }
+        }
+    }
+}
+
+android.sourceSets {
+    main {
+        jniLibs.srcDirs += [file("$buildDir/generated/libcxx")]
+    }
+}
+
+tasks.whenTaskAdded { task ->
+    if (task.name == "preBuild" || task.name.endsWith("JniLibFolders") || task.name == "mergeReleaseNativeLibs" || task.name == "mergeDebugNativeLibs") {
+        task.dependsOn(copyLibCxx)
+    }
+}

@@ -1,0 +1,26 @@
+name: needle_gpu
+description: "Needle on-device (CPU) vs WebGPU: chat, benchmark tok/s y tools."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.6.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  rust_lib_needle_gpu:
+    path: rust_builder
+  flutter_rust_bridge: 2.12.0
+  http: ^1.2.2
+  path_provider: ^2.1.4
+  file_picker: ^8.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
