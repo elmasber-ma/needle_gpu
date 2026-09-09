@@ -1,8 +1,8 @@
 name: build
 
-# Build pesado (APK + Rust + Gradle): SOLO manual desde la pestaña Actions.
-# El chequeo rápido en cada push/PR vive en check.yml.
+# Cada push dispara el build completo (APK + Rust + Gradle).
 on:
+  push:
   workflow_dispatch:
 
 jobs:
