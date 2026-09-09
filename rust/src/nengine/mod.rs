@@ -498,7 +498,8 @@ pub async fn load(path: &str) -> Result<String, String> {
                 li * 16 * 2048,
                 (li + 1) * 16 * 2048,
                 "phi_res",
-            )?)),
+            )?),
+
             pre_off: up(pre_off),
             post_off: up(post_off),
             kv_k: sbuf_zero(&device, kv_window * kv),
