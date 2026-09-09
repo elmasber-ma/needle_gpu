@@ -6,6 +6,7 @@
 //! (V2Engine::build_prompt) y el parseo de tags es el mismo.
 
 use super::needle::NeedleOut;
+use crate::frb_generated::StreamSink;
 use crate::nengine;
 
 /// Carga el .cact, dequantiza a f32 y sube todo a la GPU (~180 MB).
@@ -41,7 +42,7 @@ pub fn needle_gpu_run_stream(
     max_new_tokens: u32,
     temperature: f32,
     seed: u64,
-    sink: flutter_rust_bridge::StreamSink<String>,
+    sink: StreamSink<String>,
 ) -> Result<(), String> {
     nengine::generate_stream(&query, &tools_json, max_new_tokens, temperature, seed, &mut |piece| {
         let _ = sink.add(piece);
