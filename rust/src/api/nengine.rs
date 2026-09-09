@@ -70,10 +70,14 @@ pub fn needle_gpu_parity(query: String) -> Result<String, String> {
         model
             .step(tok, &mut st, &mut lg)
             .map_err(|e| format!("cpu step {pos}: {e}"))?;
-        if pos + 1 >= ids.len() && clog.len() < 8 {
+        // Alineado con la GPU (últimos 8 = pos P..P+7): el argmax del paso
+        // P-1 alimenta el paso P, pero sus logits no se comparan.
+        if pos + 1 >= ids.len() {
             let best = argmax(&lg);
-            ctok.push(best);
-            clog.push(lg);
+            if pos >= ids.len() && clog.len() < 8 {
+                ctok.push(best);
+                clog.push(lg);
+            }
             if pos + 1 < total {
                 seq.push(best);
             }
