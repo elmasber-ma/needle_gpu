@@ -153,33 +153,64 @@ fn cq_matvec(@builtin(global_invocation_id) id: vec3<u32>) {
   let r = id.x;
   if (r >= cqm_p.rows) { return; }
   let row = cqm_p.row_start + r;
-  let bits = cqm_p.bits;
   let group = cqm_p.group;
-  let mask = (1u << bits) - 1u;
+  // P = niveles por byte (2 bits->4, 4 bits->2, ternario->4).
+  var P = 2u;
+  if (cqm_p.is_ternary == 1u) { P = 4u; }
+  else if (cqm_p.bits == 2u) { P = 4u; }
+  let width = select(cqm_p.bits, 2u, cqm_p.is_ternary == 1u);
+  let mask = (1u << width) - 1u;
+  let per_iter = 8u / P;
+  let nbytes = group / P;
   var total: f32 = 0.0;
   var g = 0u;
   while (g < cqm_p.ngroups) {
     let norm = cqm_norms[row * cqm_p.ngroups + g];
-    var acc: f32 = 0.0;
-    var k = 0u;
-    while (k < group) {
-      let bitpos = (g * group + k) * bits;
-      let word = bitpos / 32u;
-      let shift = bitpos % 32u;
-      let base = (row * cqm_p.row_u32 + word);
-      var code = (cqm_packed[base] >> shift) & mask;
-      if (shift + bits > 32u) {
-        let lo = 32u - shift;
-        code = code | ((cqm_packed[base + 1u] & ((1u << (bits - lo)) - 1u)) << lo);
+    let row_base = row * cqm_p.row_u32;
+    let gx_base = g * group;
+    var lanes: array<f32, 8>;
+    for (var q = 0u; q < 8u; q++) { lanes[q] = 0.0; }
+    var bi = 0u;
+    let full = nbytes - nbytes % per_iter;
+    while (bi < full) {
+      var vals: array<f32, 8>;
+      for (var t = 0u; t < per_iter; t++) {
+        let bb = g * nbytes + bi + t;
+        let word = bb / 4u;
+        let byte = cqm_packed[row_base + word] >> ((bb % 4u) * 8u);
+        for (var k = 0u; k < P; k++) {
+          var code = (byte >> (k * width)) & mask;
+          var idx = code;
+          if (cqm_p.is_ternary == 1u) {
+            if (code == 3u) { idx = 0u; }
+            else if (code == 0u) { idx = 1u; }
+            else { idx = 2u; }
+          }
+          vals[t * P + k] = cqm_lv[idx];
+        }
       }
-      var idx = code;
-      if (cqm_p.is_ternary == 1u) {
-        if (code == 3u) { idx = 0u; }
-        else if (code == 0u) { idx = 1u; }
-        else { idx = 2u; }
+      for (var k = 0u; k < 8u; k++) {
+        lanes[k] += vals[k] * cqm_xh[gx_base + bi * P + k];
       }
-      acc += cqm_lv[idx] * cqm_xh[g * group + k];
-      k += 1u;
+      bi += per_iter;
+    }
+    var acc = ((((((lanes[0u] + lanes[1u]) + lanes[2u]) + lanes[3u]) + lanes[4u]) + lanes[5u]) + lanes[6u]) + lanes[7u];
+    var b = bi;
+    while (b < nbytes) {
+      let bb = g * nbytes + b;
+      let word = bb / 4u;
+      let byte = cqm_packed[row_base + word] >> ((bb % 4u) * 8u);
+      for (var k = 0u; k < P; k++) {
+        var code = (byte >> (k * width)) & mask;
+        var idx = code;
+        if (cqm_p.is_ternary == 1u) {
+          if (code == 3u) { idx = 0u; }
+          else if (code == 0u) { idx = 1u; }
+          else { idx = 2u; }
+        }
+        acc += cqm_lv[idx] * cqm_xh[gx_base + b * P + k];
+      }
+      b += 1u;
     }
     total += norm * acc;
     g += 1u;

@@ -45,12 +45,34 @@ fn f32s(v: &[f32]) -> Vec<u8> {
 
 // ------------------------------------------------------------------ estado
 
+/// Peso de matmul: o matriz f32 subida, o peso CQ empaquetado
+/// (mismos bytes del .cact, desempaquetado al vuelo en el shader).
+enum Wmat {
+    F32(wgpu::Buffer),
+    Cq(CqUp),
+}
+
+/// Vista CQ subida a GPU: blob empaquetado + normas + codebook.
+struct CqUp {
+    packed: wgpu::Buffer, // u32[]
+    norms: wgpu::Buffer,  // f32[out*ngroups]
+    levels: wgpu::Buffer, // f32 niveles del codebook / ternario
+    bits: u32,
+    row_u32: u32,
+    ngroups: u32,
+    group: u32,
+    in_padded: u32,
+    out_feat: u32,
+    is_ternary: u32,
+    nlevels: u32,
+}
+
 struct LayerBuf {
-    q: wgpu::Buffer,
-    k: wgpu::Buffer,
-    v: wgpu::Buffer,
-    g: wgpu::Buffer,
-    o: wgpu::Buffer,
+    q: Wmat,
+    k: Wmat,
+    v: Wmat,
+    g: Wmat,
+    o: Wmat,
     qn: wgpu::Buffer,
     kn: wgpu::Buffer,
     nin: wgpu::Buffer,
@@ -62,9 +84,9 @@ struct LayerBuf {
     b_pre: wgpu::Buffer,
     b_post: wgpu::Buffer,
     b_res: wgpu::Buffer,
-    phi_pre: wgpu::Buffer,
-    phi_post: wgpu::Buffer,
-    phi_res: wgpu::Buffer,
+    phi_pre: Wmat,
+    phi_post: Wmat,
+    phi_res: Wmat,
     pre_off: wgpu::Buffer,
     post_off: wgpu::Buffer,
     kv_k: wgpu::Buffer,
@@ -76,10 +98,44 @@ struct LayerBuf {
 }
 
 struct SiteBuf {
-    key: wgpu::Buffer,
-    value: wgpu::Buffer,
+    key: Wmat,
+    value: Wmat,
     taps: wgpu::Buffer,
     vring: wgpu::Buffer,
+}
+
+/// Fuente de fila de embedding en CPU (el embedding suele ser CQ-4).
+enum EmbSrc {
+    F32(Vec<f32>),
+    Cq(needle_core::cq::CqWeight),
+}
+
+impl EmbSrc {
+    fn row(&self, t: usize, d: usize, sqrt_d: f32) -> Result<Vec<f32>, String> {
+        match self {
+            EmbSrc::F32(v) => {
+                if t * d + d > v.len() {
+                    return Err(format!("token {t} fuera de vocab"));
+                }
+                let mut r = v[t * d..t * d + d].to_vec();
+                for x in r.iter_mut() {
+                    *x *= sqrt_d;
+                }
+                Ok(r)
+            }
+            EmbSrc::Cq(w) => {
+                if t >= w.out_feat {
+                    return Err(format!("token {t} fuera de vocab"));
+                }
+                let mut r = vec![0.0f32; d];
+                w.dequantize_row(t, &mut r);
+                for x in r.iter_mut() {
+                    *x *= sqrt_d;
+                }
+                Ok(r)
+            }
+        }
+    }
 }
 
 struct Act {
@@ -108,6 +164,11 @@ struct Act {
     lm: wgpu::Buffer,
     logits: wgpu::Buffer,
     alpha1: wgpu::Buffer,
+    xh_h: wgpu::Buffer,
+    xh_o: wgpu::Buffer,
+    xh_e: wgpu::Buffer,
+    xh_nx: wgpu::Buffer,
+    xh_lm: wgpu::Buffer,
 }
 
 struct Engine {
@@ -119,14 +180,14 @@ struct Engine {
     layers: Vec<LayerBuf>,
     sites: Vec<SiteBuf>,
     act: Act,
-    emb: wgpu::Buffer,
+    emb: Wmat,
     rope: wgpu::Buffer,
     dummy1: wgpu::Buffer,
     fnorm: wgpu::Buffer,
     staging: wgpu::Buffer,
     // CPU
     tok: SpTokenizer,
-    emb_cpu: Vec<f32>,
+    emb_cpu: EmbSrc,
     tables_cpu: Vec<Vec<f32>>,
     hist: Vec<u32>,
     n_layers: usize,
@@ -177,6 +238,15 @@ fn spec(entry: &str) -> &'static [(u32, bool, bool)] {
     match entry {
         "rms_norm" => &[(0, false, false), (1, false, true), (2, true, true)],
         "rms_heads" => &[(0, false, false), (1, false, true), (2, true, true)],
+        "cq_prepare" => &[(0, false, false), (1, false, true), (2, true, true)],
+        "cq_matvec" => &[
+            (0, false, false),
+            (1, false, true),
+            (2, false, true),
+            (3, false, true),
+            (4, false, true),
+            (5, true, true),
+        ],
         "matvec" => &[
             (0, false, false),
             (1, false, true),
@@ -269,6 +339,8 @@ fn build_all(
     let entries = [
         "rms_norm",
         "rms_heads",
+        "cq_prepare",
+        "cq_matvec",
         "matvec",
         "rope",
         "kv_write",
@@ -357,6 +429,125 @@ fn get_f32(cact: &Cact, idx: usize) -> Result<Vec<f32>, String> {
     }
 }
 
+fn f16s_to_f32(chunk: &[u8]) -> Vec<f32> {
+    chunk
+        .chunks_exact(2)
+        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect()
+}
+
+/// Sube un tensor de matmul: CQ → empaquetado+normas+codebook (mismo .cact,
+/// cero dequant); otro dtype → f32. [rs, rs+rows) banda para mHC.
+/// exp_out/exp_in son las dims ESPERADAS ([out,in] row-major): se verifican
+/// contra el shape en vez de asumir orientación.
+#[allow(clippy::too_many_arguments)]
+fn load_wmat(
+    device: &wgpu::Device,
+    cact: &Cact,
+    raw: &[u8],
+    codebook: &[f32],
+    idx: usize,
+    exp_out: usize,
+    exp_in: usize,
+    rs: usize,
+    rows: usize,
+    etiqueta: &str,
+) -> Result<Wmat, String> {
+    let rec = cact.record(idx);
+    if rec.dtype != DT_CQ {
+        let v = cact.floats(idx).map_err(|e| format!("floats {idx}: {e}"))?;
+        if v.len() < exp_out * exp_in {
+            return Err(format!("tensor {etiqueta} muy chico"));
+        }
+        // Banda para mHC aunque sea FP (rara vez pasa: mhc es CQ-4).
+        let band = if rows != exp_out {
+            if (rs + rows) * exp_in > v.len() {
+                return Err(format!("tensor {etiqueta}: banda FP fuera de rango"));
+            }
+            v[rs * exp_in..(rs + rows) * exp_in].to_vec()
+        } else {
+            v[..exp_out * exp_in].to_vec()
+        };
+        return Ok(Wmat::F32(sbuf(device, &f32s(&band))));
+    }
+    if rec.ndim != 2 || rec.shape.len() < 2 {
+        return Err(format!("tensor {etiqueta} no 2-D"));
+    }
+    if rec.shape[0] != exp_out || rec.shape[1] != exp_in {
+        return Err(format!(
+            "tensor {etiqueta}: shape {:?} != esperado [{exp_out},{exp_in}]",
+            &rec.shape[..2]
+        ));
+    }
+    let (out, inn) = (exp_out, exp_in);
+    let (group, bits) = (rec.group, rec.bits);
+    if group != 128 {
+        return Err(format!("tensor {etiqueta}: grupo {group} != 128 (GPU fase 2)"));
+    }
+    if bits != 2 && bits != 4 && bits != 5 {
+        return Err(format!("tensor {etiqueta}: bits {bits} sin kernel GPU"));
+    }
+    if rs + rows > out {
+        return Err(format!("tensor {etiqueta}: banda fuera de rango"));
+    }
+    let eff = if bits == 5 { 2 } else { bits as usize };
+    let in_padded = inn.div_ceil(group) * group;
+    let ngroups = in_padded / group;
+    let row_bytes = in_padded * eff / 8;
+    let n_packed = out * row_bytes;
+    let n_norms_b = out * ngroups * 2;
+    let off = rec.offset as usize;
+    let nbytes = rec.nbytes as usize;
+    if off + nbytes > raw.len() || n_packed + n_norms_b != nbytes {
+        return Err(format!(
+            "tensor {etiqueta}: blob inconsistente (off {off}, len {nbytes})"
+        ));
+    }
+    // banda de filas
+    let p0 = off + rs * row_bytes;
+    let packed_b = &raw[p0..p0 + rows * row_bytes];
+    let mut packed = Vec::with_capacity(rows * row_bytes / 4);
+    for ch in packed_b.chunks_exact(4) {
+        packed.push(u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]));
+    }
+    let nb0 = off + n_packed + rs * ngroups * 2;
+    let norms = f16s_to_f32(&raw[nb0..nb0 + rows * ngroups * 2]);
+    let levels: Vec<f32> = if bits == 5 {
+        let c = 1.2240064 / (group as f32).sqrt();
+        vec![-c, 0.0, c]
+    } else if bits == 2 {
+        codebook
+            .get(0..4)
+            .ok_or_else(|| format!("tensor {etiqueta}: codebook corto"))?
+            .to_vec()
+    } else {
+        codebook
+            .get(12..28)
+            .ok_or_else(|| format!("tensor {etiqueta}: codebook corto"))?
+            .to_vec()
+    };
+    let nlevels = levels.len() as u32;
+    Ok(Wmat::Cq(CqUp {
+        packed: sbuf(device, & {
+            let mut b = Vec::with_capacity(packed.len() * 4);
+            for w in &packed {
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+            b
+        }),
+        norms: sbuf(device, &f32s(&norms)),
+        levels: sbuf(device, &f32s(&levels)),
+        bits: bits as u32,
+        row_u32: (row_bytes / 4) as u32,
+        ngroups: ngroups as u32,
+        group: group as u32,
+        in_padded: in_padded as u32,
+        out_feat: rows as u32,
+        is_ternary: if bits == 5 { 1 } else { 0 },
+        nlevels,
+    }))
+}
+
 /// Rebana con chequeo (los slices fuera de rango son error, no panic).
 fn sl(v: &[f32], a: usize, b: usize, name: &str) -> Result<Vec<f32>, String> {
     if b > v.len() || a > b {
@@ -425,9 +616,30 @@ pub async fn load(path: &str) -> Result<String, String> {
     let (pipes, layouts) = build_all(&device)?;
     let up = |v: Vec<f32>| sbuf(&device, &f32s(&v));
 
-    // embedding (GPU + copia CPU para lookup de fila)
-    let emb_cpu = get_f32(&cact, lay.embedding)?;
-    let emb = up(emb_cpu.clone());
+    // bytes crudos del .cact para subir CQ empaquetado tal cual
+    let raw = std::fs::read(path).map_err(|e| format!("releer {path}: {e}"))?;
+    let codebook = cact.codebook.clone();
+    let wm = |idx: usize, o: usize, i: usize, rs: usize, r: usize, et: &str| {
+        load_wmat(&device, &cact, &raw, &codebook, idx, o, i, rs, r, et)
+    };
+
+    // embedding: Wmat a GPU + fuente de fila en CPU (CQ → dequant 1 fila)
+    let emb_rec = cact.record(lay.embedding);
+    if emb_rec.ndim != 2 || emb_rec.shape.len() < 2 {
+        return Err("embedding no 2-D".into());
+    }
+    let emb = wm(lay.embedding, vocab, d, 0, vocab, "emb")?;
+    let emb_cpu = if emb_rec.dtype == DT_CQ {
+        let w = cact
+            .cq(lay.embedding)
+            .map_err(|e| format!("cq emb: {e}"))?;
+        if w.in_feat != d {
+            return Err("embedding CQ con in != d".into());
+        }
+        EmbSrc::Cq(w)
+    } else {
+        EmbSrc::F32(get_f32(&cact, lay.embedding)?)
+    };
 
     // tabla RoPE cos/sin intercalada [t*64 + 2i]
     let max_seq = g.max_seq_len;
@@ -468,11 +680,11 @@ pub async fn load(path: &str) -> Result<String, String> {
         let phi_post_v = gw(lay.mhc.phi_post)?;
         let phi_res_v = gw(lay.mhc.phi_res)?;
         layers.push(LayerBuf {
-            q: up(gw(l.q_proj)?),
-            k: up(gw(l.k_proj)?),
-            v: up(gw(l.v_proj)?),
-            g: up(gw(l.gate_proj)?),
-            o: up(gw(l.out_proj)?),
+            q: wm(l.q_proj, attn, d, 0, attn, "q")?,
+            k: wm(l.k_proj, kv, d, 0, kv, "k")?,
+            v: wm(l.v_proj, kv, d, 0, kv, "v")?,
+            g: wm(l.gate_proj, attn, d, 0, attn, "g")?,
+            o: wm(l.out_proj, d, attn, 0, d, "o")?,
             qn: up(gw(l.q_norm)?),
             kn: up(gw(l.k_norm)?),
             nin: up(gw(l.norm_in)?),
@@ -484,24 +696,30 @@ pub async fn load(path: &str) -> Result<String, String> {
             b_pre: up(sl(&b_pre_v, li * 4, li * 4 + 4, "b_pre")?),
             b_post: up(sl(&b_post_v, li * 4, li * 4 + 4, "b_post")?),
             b_res: up(sl(&b_res_v, li * 16, li * 16 + 16, "b_res")?),
-            phi_pre: up(sl(
-                &phi_pre_v,
-                li * 4 * 2048,
-                (li + 1) * 4 * 2048,
+            phi_pre: wm(
+                lay.mhc.phi_pre,
+                n_layers * 4,
+                2048,
+                li * 4,
+                4,
                 "phi_pre",
-            )?),
-            phi_post: up(sl(
-                &phi_post_v,
-                li * 4 * 2048,
-                (li + 1) * 4 * 2048,
+            )?,
+            phi_post: wm(
+                lay.mhc.phi_post,
+                n_layers * 4,
+                2048,
+                li * 4,
+                4,
                 "phi_post",
-            )?),
-            phi_res: up(sl(
-                &phi_res_v,
-                li * 16 * 2048,
-                (li + 1) * 16 * 2048,
+            )?,
+            phi_res: wm(
+                lay.mhc.phi_res,
+                n_layers * 16,
+                2048,
+                li * 16,
+                16,
                 "phi_res",
-            )?),
+            )?,
 
             pre_off: up(pre_off),
             post_off: up(post_off),
@@ -514,15 +732,15 @@ pub async fn load(path: &str) -> Result<String, String> {
         });
     }
 
-    // engrams: tablas a CPU (gather), projs+taps a GPU
+    // engrams: tablas a CPU (gather), projs a GPU (mismo peso), taps f32
     let mut sites = Vec::new();
     let mut tables_cpu = Vec::new();
     for s in lay.engrams.iter() {
         tables_cpu.push(get_f32(&cact, s.tables)?);
         let ring = g.engram_conv_taps * g.engram_conv_dilation + 1;
         sites.push(SiteBuf {
-            key: up(get_f32(&cact, s.key_proj)?),
-            value: up(get_f32(&cact, s.value_proj)?),
+            key: wm(s.key_proj, d, d, 0, d, "ekey")?,
+            value: wm(s.value_proj, d, d, 0, d, "evalue")?,
             taps: up(get_f32(&cact, s.taps)?),
             vring: sbuf_zero(&device, ring * d),
         });
@@ -554,6 +772,11 @@ pub async fn load(path: &str) -> Result<String, String> {
         lm: sbuf_zero(&device, d),
         logits: sbuf_zero(&device, vocab),
         alpha1: sbuf_zero(&device, 1),
+        xh_h: sbuf_zero(&device, d),
+        xh_o: sbuf_zero(&device, d),
+        xh_e: sbuf_zero(&device, d),
+        xh_nx: sbuf_zero(&device, 2048),
+        xh_lm: sbuf_zero(&device, d),
     };
     let fnorm = up(get_f32(&cact, lay.final_norm)?);
 
@@ -665,6 +888,55 @@ impl Engine {
         self.run(enc, "matvec", &[y, w, x, &u], div64(rows));
     }
 
+    /// Rotación Hadamard de la activación (una vez por activación; la
+    /// comparten todas las projs que la leen, como prepare_input del CPU).
+    fn prepare(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        xh: &wgpu::Buffer,
+        x: &wgpu::Buffer,
+        in_feat: u32,
+    ) {
+        let ng = in_feat / 128;
+        let u = self.ub(&u16f(in_feat, ng, 0, 0));
+        self.run(enc, "cq_prepare", &[xh, x, &u], ng);
+    }
+
+    /// Proyección y = W @ x: ruta CQ empaquetada o f32 según el tensor.
+    /// Para CQ, xh debe venir de prepare() sobre la misma activación.
+    fn proj(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        y: &wgpu::Buffer,
+        w: &Wmat,
+        x: &wgpu::Buffer,
+        xh: &wgpu::Buffer,
+        rows: u32,
+        in_feat: u32,
+    ) {
+        match w {
+            Wmat::F32(b) => self.matvec(enc, y, b, x, rows, in_feat),
+            Wmat::Cq(c) => {
+                let mut v = Vec::with_capacity(32);
+                v.extend_from_slice(&rows.to_le_bytes());
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&c.ngroups.to_le_bytes());
+                v.extend_from_slice(&c.group.to_le_bytes());
+                v.extend_from_slice(&c.bits.to_le_bytes());
+                v.extend_from_slice(&c.row_u32.to_le_bytes());
+                v.extend_from_slice(&c.is_ternary.to_le_bytes());
+                v.extend_from_slice(&c.nlevels.to_le_bytes());
+                let u = self.ub(&v);
+                self.run(
+                    enc,
+                    "cq_matvec",
+                    &[y, &c.packed, &c.norms, xh, &c.levels, &u],
+                    div64(rows),
+                );
+            }
+        }
+    }
+
     fn norm(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -688,17 +960,9 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
     let pos_u = pos as u32;
     let sqrt_d = (eng.d as f32).sqrt();
 
-    // embedding lookup en CPU (1 fila) → upload
-    let t = token as usize;
-    if t * eng.d + eng.d > eng.emb_cpu.len() {
-        return Err(format!("token {token} fuera de vocab"));
-    }
-    let mut x0 = eng.emb_cpu[t * eng.d..t * eng.d + eng.d].to_vec();
-    for v in x0.iter_mut() {
-        *v *= sqrt_d;
-    }
-    eng.queue
-        .write_buffer(&eng.act.h, 0, &f32s(&x0));
+    // embedding lookup en CPU (1 fila, CQ → dequant solo esa fila)
+    let x0 = eng.emb_cpu.row(token as usize, eng.d, sqrt_d)?;
+    eng.queue.write_buffer(&eng.act.h, 0, &f32s(&x0));
 
     let mut enc = eng
         .device
@@ -736,8 +1000,9 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
         }
         eng.queue.write_buffer(&a.e, 0, &f32s(&e));
         let s = &eng.sites[si];
-        eng.matvec(&mut enc, &a.ek, &s.key, &a.e, 512, 512);
-        eng.matvec(&mut enc, &a.ev, &s.value, &a.e, 512, 512);
+        eng.prepare(&mut enc, &a.xh_e, &a.e, 512);
+        eng.proj(&mut enc, &a.ek, &s.key, &a.e, &a.xh_e, 512, 512);
+        eng.proj(&mut enc, &a.ev, &s.value, &a.e, &a.xh_e, 512, 512);
         enc.copy_buffer_to_buffer(
             &a.ev,
             0,
@@ -762,7 +1027,8 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
         // mHC-pre
         eng.run(&mut enc, "copy_buf", &[&a.nx, lin, &eng.ub(&u16f(2048, 0, 0, 0))], div64(2048));
         eng.norm(&mut enc, &a.nx, None, 2048);
-        eng.matvec(&mut enc, &a.s4, &l.phi_pre, &a.nx, 4, 2048);
+        eng.prepare(&mut enc, &a.xh_nx, &a.nx, 2048);
+        eng.proj(&mut enc, &a.s4, &l.phi_pre, &a.nx, &a.xh_nx, 4, 2048);
         {
             let u = eng.ub(&{
                 let mut v = Vec::with_capacity(16);
@@ -797,11 +1063,12 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
         // block
         eng.run(&mut enc, "copy_buf", &[&a.h, &a.bx, &eng.ub(&u16f(512, 0, 0, 0))], div64(512));
         eng.norm(&mut enc, &a.h, Some(&l.nin), 512);
-        eng.matvec(&mut enc, &a.q, &l.q, &a.h, 512, 512);
-        eng.matvec(&mut enc, &a.k, &l.k, &a.h, 256, 512);
-        eng.matvec(&mut enc, &a.v, &l.v, &a.h, 256, 512);
+        eng.prepare(&mut enc, &a.xh_h, &a.h, 512);
+        eng.proj(&mut enc, &a.q, &l.q, &a.h, &a.xh_h, 512, 512);
+        eng.proj(&mut enc, &a.k, &l.k, &a.h, &a.xh_h, 256, 512);
+        eng.proj(&mut enc, &a.v, &l.v, &a.h, &a.xh_h, 256, 512);
         // gate va a su propio buffer: attention pisa a.o después.
-        eng.matvec(&mut enc, &a.gt, &l.g, &a.h, 512, 512);
+        eng.proj(&mut enc, &a.gt, &l.g, &a.h, &a.xh_h, 512, 512);
         {
             let u = eng.ub(&u16f(512, 0, 0, 0));
             eng.run(&mut enc, "rms_heads", &[&a.q, &l.qn, &u], div64(512));
@@ -845,7 +1112,8 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
             let u = eng.ub(&u16f(512, 0, 0, 0));
             eng.run(&mut enc, "elem", &[&a.o, &a.gt, &u], div64(512)); // modo 0
         }
-        eng.matvec(&mut enc, &a.ar, &l.o, &a.o, 512, 512);
+        eng.prepare(&mut enc, &a.xh_o, &a.o, 512);
+        eng.proj(&mut enc, &a.ar, &l.o, &a.o, &a.xh_o, 512, 512);
         eng.norm(&mut enc, &a.ar, Some(&l.pnorm), 512);
         {
             let s = 1.0 / (1.0 + (-l.agate).exp());
@@ -871,8 +1139,8 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
             eng.run(&mut enc, "combine", &[&a.y, &a.m, &a.u, &u], div64(512));
         }
 
-        // mHC-post
-        eng.matvec(&mut enc, &a.s16, &l.phi_res, &a.nx, 16, 2048);
+        // mHC-post (reusa xh_nx ya preparado)
+        eng.proj(&mut enc, &a.s16, &l.phi_res, &a.nx, &a.xh_nx, 16, 2048);
         {
             let u = eng.ub(&u16fb(l.a_res, 16));
             eng.run(
@@ -883,7 +1151,7 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
             );
         }
         eng.run(&mut enc, "sinkhorn", &[&a.t16], 1);
-        eng.matvec(&mut enc, &a.s4, &l.phi_post, &a.nx, 4, 2048);
+        eng.proj(&mut enc, &a.s4, &l.phi_post, &a.nx, &a.xh_nx, 4, 2048);
         {
             let mut v = Vec::with_capacity(16);
             v.extend_from_slice(&l.a_post.to_le_bytes());
@@ -913,7 +1181,16 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
     };
     eng.run(&mut enc, "mean_lanes", &[&a.lm, last], div64(512));
     eng.norm(&mut enc, &a.lm, Some(&eng.fnorm), 512);
-    eng.matvec(&mut enc, &a.logits, &eng.emb, &a.lm, eng.vocab as u32, 512);
+    eng.prepare(&mut enc, &a.xh_lm, &a.lm, 512);
+    eng.proj(
+        &mut enc,
+        &a.logits,
+        &eng.emb,
+        &a.lm,
+        &a.xh_lm,
+        eng.vocab as u32,
+        512,
+    );
     enc.copy_buffer_to_buffer(
         &a.logits,
         0,

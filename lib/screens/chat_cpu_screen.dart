@@ -177,7 +177,7 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
                             }
                           },
                     icon: const Icon(Icons.memory_rounded, size: 18),
-                    label: const Text('Cargar GPU (~180 MB)',
+                    label: const Text('Cargar GPU (~20 MB)',
                         style: TextStyle(fontSize: 12)),
                   ),
                 if (_gsvc.loadedGpu)
