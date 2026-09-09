@@ -1334,6 +1334,53 @@ pub fn diag_step() -> Result<String, String> {
     ))
 }
 
+/// IDs del prompt (diagnóstico de paridad): mismo prompt que generate.
+pub fn prompt_ids(query: &str, tools_json: &str) -> Result<Vec<u32>, String> {
+    let g = ENG
+        .lock()
+        .map_err(|_| "mutex envenenado".to_string())?;
+    let eng = g.as_ref().ok_or("motor GPU no cargado")?;
+    Ok(eng
+        .tok
+        .encode(&V2Engine::build_prompt(query, tools_json, None)))
+}
+
+/// Logits GPU paso a paso sobre `ids` (resetea el estado primero).
+/// Devuelve los logits de los últimos `tail` pasos.
+pub fn gpu_logits_stepped(ids: &[u32], tail: usize) -> Result<Vec<Vec<f32>>, String> {
+    let mut g = ENG
+        .lock()
+        .map_err(|_| "mutex envenenado".to_string())?;
+    let eng = g.as_mut().ok_or("motor GPU no cargado")?;
+    // reset total: cachés KV, anillos engram, lanes e historial
+    eng.hist.clear();
+    let z_kv = vec![0u8; eng.kv_window * eng.kv * 4];
+    for l in &eng.layers {
+        eng.queue.write_buffer(&l.kv_k, 0, &z_kv);
+        eng.queue.write_buffer(&l.kv_v, 0, &z_kv);
+    }
+    let z_vr = vec![0u8; eng.vring_n * eng.d * 4];
+    for s in &eng.sites {
+        eng.queue.write_buffer(&s.vring, 0, &z_vr);
+    }
+    let z_l = vec![0u8; 2048 * 4];
+    eng.queue.write_buffer(&eng.act.lanes_a, 0, &z_l);
+    eng.queue.write_buffer(&eng.act.lanes_b, 0, &z_l);
+    eng.hist.extend_from_slice(ids);
+    let start = ids.len().saturating_sub(tail);
+    let mut out = Vec::new();
+    for (pos, &tok) in ids.iter().enumerate() {
+        if pos >= eng.max_seq {
+            return Err("contexto lleno".into());
+        }
+        let lg = step_token(eng, tok, pos)?;
+        if pos >= start {
+            out.push(lg);
+        }
+    }
+    Ok(out)
+}
+
 pub fn generate(
     query: &str,
     tools_json: &str,

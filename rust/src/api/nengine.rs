@@ -33,58 +33,93 @@ pub fn needle_gpu_diag() -> Result<String, String> {
     nengine::diag_step()
 }
 
-/// Paridad CPU vs GPU en 8 tokens greedy (detecta divergencia numérica).
-/// Orquesta un motor CPU temporal + el GPU residente: vive en el api,
-/// no dentro del módulo GPU.
+/// Paridad CPU vs GPU en 8 pasos greedy con logits comparados.
+///
+/// Corre el CPU (`V2Model::step`, referencia oficial) y la GPU sobre la
+/// MISMA secuencia (prompt + 8 greedy del CPU) y compara los vectores de
+/// logits completos: `dmax` = max|Δ| por paso. dmax chico = ruido fp32,
+/// dmax grande = bug en el port.
 #[flutter_rust_bridge::frb(sync)]
 pub fn needle_gpu_parity(query: String) -> Result<String, String> {
-    use needle_infer::v2_engine::{GenerateOptions, V2Engine};
+    use needle_infer::v2_engine::V2Engine;
+    use std::cmp::Ordering;
     let cact_path = nengine::cact_path()?;
     let cpu = V2Engine::load(&cact_path).map_err(|e| format!("cpu load: {e}"))?;
-    let opts = GenerateOptions {
-        max_new_tokens: 8,
-        temperature: 0.0,
-        seed: 0,
-        system: None,
-        prefill_chunk: 128,
-        constrain: false,
+    let model = cpu.model();
+    let vocab = model.cfg.vocab_size;
+    let ids = nengine::prompt_ids(&query, "[]")?;
+    if ids.is_empty() {
+        return Err("prompt vacío".into());
+    }
+    let argmax = |lg: &[f32]| {
+        lg.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0)
     };
-    let rc = cpu.generate(&query, "[]", &opts, |_, _| {});
-    let rg = nengine::generate_inner(&query, "[]", 8, 0.0, 0, &mut |_| {})?;
-    let n = rc.token_ids.len().min(rg.token_ids.len()).min(8);
-    let mut dif = None;
-    for k in 0..n {
-        if rc.token_ids[k] != rg.token_ids[k] {
-            dif = Some(k);
-            break;
+    // CPU stepped greedy: prompt + 8 (generate_sequential == generate).
+    let mut st = model.make_state();
+    let mut seq = ids.clone();
+    let mut clog: Vec<Vec<f32>> = Vec::new();
+    let mut ctok: Vec<u32> = Vec::new();
+    let total = ids.len() + 8;
+    for pos in 0..total {
+        let tok = *seq.get(pos).ok_or("secuencia corta")?;
+        let mut lg = vec![0.0f32; vocab];
+        model
+            .step(tok, &mut st, &mut lg)
+            .map_err(|e| format!("cpu step {pos}: {e}"))?;
+        if pos + 1 >= ids.len() && clog.len() < 8 {
+            let best = argmax(&lg);
+            ctok.push(best);
+            clog.push(lg);
+            if pos + 1 < total {
+                seq.push(best);
+            }
         }
+    }
+    // GPU sobre la misma secuencia; últimos 8 logits.
+    let glog = nengine::gpu_logits_stepped(&seq, 8)?;
+    if glog.len() != 8 {
+        return Err(format!("gpu devolvió {} logits", glog.len()));
     }
     let show = |v: &[u32]| {
         v.iter()
-            .take(8)
             .map(|x| x.to_string())
             .collect::<Vec<_>>()
             .join(",")
     };
-    let gaps = rg
-        .margins
+    let gtok: Vec<u32> = glog.iter().map(|lg| argmax(lg)).collect();
+    let mut dif = None;
+    let mut dmax = Vec::with_capacity(8);
+    for k in 0..8 {
+        if ctok[k] != gtok[k] && dif.is_none() {
+            dif = Some(k);
+        }
+        let mut m = 0.0f32;
+        for (a, b) in clog[k].iter().zip(glog[k].iter()) {
+            m = m.max((a - b).abs());
+        }
+        dmax.push(m);
+    }
+    let ds = dmax
         .iter()
-        .map(|(id, g)| format!("{id}:{g:.3}"))
+        .map(|m| format!("{m:.3}"))
         .collect::<Vec<_>>()
         .join(" ");
     match dif {
-        None if rc.token_ids.len() == rg.token_ids.len() => Ok(format!(
-            "MATCH 8/8 · cpu=[{}] gpu=[{}] · gaps=[{}]",
-            show(&rc.token_ids),
-            show(&rg.token_ids),
-            gaps
+        None => Ok(format!(
+            "MATCH 8/8 · cpu=[{}] gpu=[{}] · dmax=[{}] (<0.5 = ruido)",
+            show(&ctok),
+            show(&gtok),
+            ds
         )),
-        _ => Ok(format!(
-            "DIF@{} · cpu=[{}] gpu=[{}] · gaps=[{}] (gap<0.05 en el flip = ruido; gap grande = bug)",
-            dif.map(|k| k.to_string()).unwrap_or("len".into()),
-            show(&rc.token_ids),
-            show(&rg.token_ids),
-            gaps
+        Some(k) => Ok(format!(
+            "DIF@{k} · cpu=[{}] gpu=[{}] · dmax=[{}] (dmax<0.5 = ruido; grande = bug)",
+            show(&ctok),
+            show(&gtok),
+            ds
         )),
     }
 }
