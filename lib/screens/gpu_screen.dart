@@ -7,6 +7,7 @@ import '../services/gpu/gpu_context.dart';
 import '../services/gpu/gpu_gelu.dart';
 import '../services/gpu/gpu_linear.dart';
 import '../services/gpu/gpu_shader_lab.dart';
+import 'copy_btn.dart';
 
 class _OpRow {
   final String nombre;
@@ -219,6 +220,8 @@ class _GpuScreenState extends State<GpuScreen> {
                   subtitle: Text(r.detalle,
                       style: const TextStyle(
                           fontSize: 10, fontFamily: 'monospace')),
+                  trailing:
+                      CopyBtn(texto: () => '${r.nombre}\n${r.detalle}'),
                 ),
               );
             },

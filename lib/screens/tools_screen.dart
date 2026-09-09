@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../services/needle_service.dart';
 import '../services/tools.dart';
+import 'copy_btn.dart';
 import 'model_card.dart';
 
 /// Tab 4 · Tools: loop agéntico con Needle on-device.
@@ -124,13 +125,29 @@ class _ToolsScreenState extends State<ToolsScreen> {
               borderRadius: BorderRadius.circular(8),
               border: Border.all(color: Colors.grey[800]!),
             ),
-            child: SingleChildScrollView(
-              reverse: true,
-              child: SelectableText(
-                _log.isEmpty ? '· log del agente ·' : _log.join('\n'),
-                style: const TextStyle(
-                    fontSize: 11, fontFamily: 'monospace'),
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: CopyBtn(
+                      texto: () => _log.isEmpty
+                          ? '· log del agente ·'
+                          : _log.join('\n')),
+                ),
+                Expanded(
+                  child: SingleChildScrollView(
+                    reverse: true,
+                    child: SelectableText(
+                      _log.isEmpty
+                          ? '· log del agente ·'
+                          : _log.join('\n'),
+                      style: const TextStyle(
+                          fontSize: 11, fontFamily: 'monospace'),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ),

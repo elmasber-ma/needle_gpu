@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../services/needle_service.dart';
 import '../services/tools.dart';
+import 'copy_btn.dart';
 import 'model_card.dart';
 
 class _Msg {
@@ -188,6 +189,15 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
                                         fontSize: 9,
                                         fontFamily: 'monospace',
                                         color: Colors.grey)),
+                              ),
+                            if (!m.user)
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: CopyBtn(
+                                    size: 14,
+                                    texto: () => m.meta.isEmpty
+                                        ? m.text
+                                        : '${m.text}\n${m.meta}'),
                               ),
                           ],
                         ),

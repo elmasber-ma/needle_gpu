@@ -4,6 +4,7 @@ import '../services/gpu/gpu_context.dart';
 import '../services/gpu/gpu_linear.dart';
 import '../services/needle_service.dart';
 import '../services/tools.dart';
+import 'copy_btn.dart';
 import 'model_card.dart';
 
 class _Fila {
@@ -165,11 +166,13 @@ class _BenchScreenState extends State<BenchScreen> {
                   dense: true,
                   title: Text(f.nombre,
                       style: const TextStyle(fontSize: 12)),
-                  trailing: Text(f.valor,
+                  subtitle: Text(f.valor,
                       style: const TextStyle(
                           fontSize: 12,
                           fontFamily: 'monospace',
                           color: Colors.greenAccent)),
+                  trailing:
+                      CopyBtn(texto: () => '${f.nombre}: ${f.valor}'),
                 ),
               );
             },

@@ -563,7 +563,9 @@ pub async fn load(path: &str) -> Result<String, String> {
         mapped_at_creation: false,
     });
 
-    let dummy1 = ubuf(&device, &[0u8; 4]);
+    // Dummy para el slot STORAGE de gamma cuando no hay (tiene que ser
+    // STORAGE aunque el kernel no lo lea: si no, validación).
+    let dummy1 = sbuf(&device, &[0u8; 4]);
     let eng = Engine {
         device,
         queue,
