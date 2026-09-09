@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use needle_infer::cact::{Cact, DT_CQ};
 use needle_infer::sp_tokenizer::SpTokenizer;
 use needle_infer::v2_engine::V2Engine;
+use wgpu::util::DeviceExt;
 
 const SHADERS: &str = include_str!("shaders.wgsl");
 const SQRT_D: f32 = 22.627417; // sqrt(512)
@@ -86,6 +87,7 @@ struct Act {
     q: wgpu::Buffer,
     k: wgpu::Buffer,
     v: wgpu::Buffer,
+    gt: wgpu::Buffer,
     o: wgpu::Buffer,
     ar: wgpu::Buffer,
     y: wgpu::Buffer,
@@ -530,6 +532,7 @@ pub async fn load(path: &str) -> Result<String, String> {
         q: sbuf_zero(&device, attn),
         k: sbuf_zero(&device, kv),
         v: sbuf_zero(&device, kv),
+        gt: sbuf_zero(&device, attn),
         o: sbuf_zero(&device, attn),
         ar: sbuf_zero(&device, d),
         y: sbuf_zero(&device, d),
@@ -785,7 +788,6 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
                 &[&a.bx, &a.u, &a.alpha1, &a.ev, &eng.ub(&u16f(512, 0, 0, 0))],
                 div64(512),
             );
-            let _ = s;
         }
 
         // block
@@ -794,7 +796,8 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
         eng.matvec(&mut enc, &a.q, &l.q, &a.h, 512, 512);
         eng.matvec(&mut enc, &a.k, &l.k, &a.h, 256, 512);
         eng.matvec(&mut enc, &a.v, &l.v, &a.h, 256, 512);
-        eng.matvec(&mut enc, &a.o, &l.g, &a.h, 512, 512);
+        // gate va a su propio buffer: attention pisa a.o después.
+        eng.matvec(&mut enc, &a.gt, &l.g, &a.h, 512, 512);
         {
             let u = eng.ub(&u16f(512, 0, 0, 0));
             eng.run(&mut enc, "rms_heads", &[&a.q, &l.qn, &u], div64(512));
@@ -836,7 +839,7 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
         }
         {
             let u = eng.ub(&u16f(512, 0, 0, 0));
-            eng.run(&mut enc, "elem", &[&a.o, &a.g, &u], div64(512)); // modo 0
+            eng.run(&mut enc, "elem", &[&a.o, &a.gt, &u], div64(512)); // modo 0
         }
         eng.matvec(&mut enc, &a.ar, &l.o, &a.o, 512, 512);
         eng.norm(&mut enc, &a.ar, Some(&l.pnorm), 512);
@@ -905,7 +908,7 @@ fn step_token(eng: &Engine, token: u32, pos: usize) -> Result<Vec<f32>, String> 
         &a.lanes_a
     };
     eng.run(&mut enc, "mean_lanes", &[&a.lm, last], div64(512));
-    eng.norm(&mut enc, &a.lm, Some(&eng.fnorm_buf()), 512);
+    eng.norm(&mut enc, &a.lm, Some(&eng.fnorm), 512);
     eng.matvec(&mut enc, &a.logits, &eng.emb, &a.lm, eng.vocab as u32, 512);
     enc.copy_buffer_to_buffer(
         &a.logits,
