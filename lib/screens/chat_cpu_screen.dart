@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../services/needle_service.dart';
+import '../services/needle_gpu_service.dart';
 import '../services/tools.dart';
 import 'copy_btn.dart';
 import 'model_card.dart';
@@ -23,21 +24,33 @@ class ChatCpuScreen extends StatefulWidget {
 
 class _ChatCpuScreenState extends State<ChatCpuScreen> {
   final _svc = NeedleService.instance;
+  final _gsvc = NeedleGpuService.instance;
   final _ctrl = TextEditingController();
   final _msgs = <_Msg>[];
   bool _busy = false;
   bool _gpu = false;
 
   @override
+  void initState() {
+    super.initState();
+    _gsvc.addListener(_refresh);
+  }
+
+  @override
   void dispose() {
+    _gsvc.removeListener(_refresh);
     _ctrl.dispose();
     super.dispose();
+  }
+
+  void _refresh() {
+    if (mounted) setState(() {});
   }
 
   Future<void> _enviar() async {
     final q = _ctrl.text.trim();
     if (q.isEmpty || _busy) return;
-    final listo = _gpu ? _svc.loadedGpu : _svc.loaded;
+    final listo = _gpu ? _gsvc.loadedGpu : _svc.loaded;
     if (!listo) {
       setState(() => _msgs.add(_Msg(
           false, _gpu ? 'Cargá el modelo GPU primero.' : 'Cargá el modelo primero.')));
@@ -55,7 +68,7 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
       setState(() => _msgs.add(_Msg(false, '', 'GPU · generando…')));
       final sw = Stopwatch()..start();
       try {
-        await for (final piece in _svc.runGpuStream(
+        await for (final piece in _gsvc.runStream(
             query: q, toolsJson: '[]', maxNewTokens: 256)) {
           buf.write(piece);
           if (mounted) {
@@ -129,10 +142,10 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
               ),
               const SizedBox(width: 8),
               if (_gpu)
-                Text(_svc.loadedGpu ? 'GPU lista' : 'GPU sin cargar',
+                Text(_gsvc.loadedGpu ? 'GPU lista' : 'GPU sin cargar',
                     style: TextStyle(
                         fontSize: 11,
-                        color: _svc.loadedGpu
+                        color: _gsvc.loadedGpu
                             ? Colors.greenAccent
                             : Colors.orangeAccent)),
             ],
@@ -143,14 +156,14 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
             padding: const EdgeInsets.fromLTRB(10, 6, 10, 0),
             child: Row(
               children: [
-                if (!_svc.loadedGpu)
+                if (!_gsvc.loadedGpu)
                   FilledButton.icon(
                     onPressed: _busy
                         ? null
                         : () async {
                             setState(() => _busy = true);
                             try {
-                              final r = await _svc.loadGpu();
+                              final r = await _gsvc.load();
                               if (mounted) {
                                 setState(() => _msgs.add(_Msg(false, r)));
                               }
@@ -167,24 +180,24 @@ class _ChatCpuScreenState extends State<ChatCpuScreen> {
                     label: const Text('Cargar GPU (~180 MB)',
                         style: TextStyle(fontSize: 12)),
                   ),
-                if (_svc.loadedGpu)
+                if (_gsvc.loadedGpu)
                   OutlinedButton.icon(
                     onPressed: () {
-                      _svc.unloadGpu();
+                      _gsvc.unload();
                       setState(() {});
                     },
                     icon: const Icon(Icons.eject_rounded, size: 18),
                     label: const Text('Liberar GPU',
                         style: TextStyle(fontSize: 12)),
                   ),
-                if (_svc.loadedGpu)
+                if (_gsvc.loadedGpu)
                   OutlinedButton.icon(
                     onPressed: _busy
                         ? null
                         : () async {
                             setState(() => _busy = true);
                             try {
-                              final r = await _svc.gpuDiag();
+                              final r = await _gsvc.diag();
                               if (mounted) {
                                 setState(() =>
                                     _msgs.add(_Msg(false, r, 'GPU diag')));

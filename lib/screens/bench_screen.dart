@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/gpu/gpu_context.dart';
 import '../services/gpu/gpu_linear.dart';
 import '../services/needle_service.dart';
+import '../services/needle_gpu_service.dart';
 import '../services/tools.dart';
 import 'copy_btn.dart';
 import 'model_card.dart';
@@ -25,6 +26,7 @@ class BenchScreen extends StatefulWidget {
 
 class _BenchScreenState extends State<BenchScreen> {
   final _svc = NeedleService.instance;
+  final _gsvc = NeedleGpuService.instance;
   final _filas = <_Fila>[];
   bool _busy = false;
 
@@ -86,11 +88,11 @@ class _BenchScreenState extends State<BenchScreen> {
                 ),
             'Needle CPU');
       }
-      if (!_svc.loadedGpu) {
+      if (!_gsvc.loadedGpu) {
         _filas.add(_Fila('Needle GPU', 'motor GPU sin cargar (tab Chat)'));
       } else {
         await _benchNeedle(
-            () => _svc.runGpu(
+            () => _gsvc.run(
                   query: _benchPrompt,
                   toolsJson: '[]',
                   maxNewTokens: 128,
@@ -151,13 +153,13 @@ class _BenchScreenState extends State<BenchScreen> {
                 label: const Text('Correr benchmark'),
               ),
               OutlinedButton.icon(
-                onPressed: (_busy || !_svc.loadedGpu)
+                onPressed: (_busy || !_gsvc.loadedGpu)
                     ? null
                     : () async {
                         setState(() => _busy = true);
                         try {
                           final r =
-                              await _svc.gpuParity('Hola');
+                              await _gsvc.parity('Hola');
                           if (mounted) {
                             setState(() =>
                                 _filas.insert(0, _Fila('Paridad', r)));

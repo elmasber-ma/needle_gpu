@@ -1079,7 +1079,7 @@ pub fn generate_stream(
     generate_inner(query, tools_json, max_new_tokens, temperature, seed, emit)
 }
 
-fn generate_inner(
+pub(crate) fn generate_inner(
     query: &str,
     tools_json: &str,
     max_new_tokens: u32,
@@ -1166,70 +1166,20 @@ fn generate_inner(
     })
 }
 
-/// Paridad CPU vs GPU: mismos 8 tokens greedy, compara id por id.
-/// Carga un motor CPU temporal con el mismo .cact (no toca el GPU).
-pub fn parity(query: &str) -> Result<String, String> {
-    let cact_path = {
-        let g = ENG
-            .lock()
-            .map_err(|_| "mutex envenenado".to_string())?;
-        g.as_ref().ok_or("motor GPU no cargado")?.cact_path.clone()
-    };
-    use needle_infer::v2_engine::{GenerateOptions, V2Engine};
-    let cpu = V2Engine::load(&cact_path)
-        .map_err(|e| format!("cpu load: {e}"))?;
-    let opts = GenerateOptions {
-        max_new_tokens: 8,
-        temperature: 0.0,
-        seed: 0,
-        system: None,
-        prefill_chunk: 128,
-        constrain: false,
-    };
-    let rc = cpu.generate(query, "[]", &opts, |_, _| {});
-    let rg = generate_inner(query, "[]", 8, 0.0, 0, &mut |_| {})?;
-    let n = rc.token_ids.len().min(rg.token_ids.len()).min(8);
-    let mut dif = None;
-    for k in 0..n {
-        if rc.token_ids[k] != rg.token_ids[k] {
-            dif = Some(k);
-            break;
-        }
-    }
-    let show = |v: &[u32]| {
-        v.iter()
-            .take(8)
-            .map(|x| x.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let gaps = rg
-        .margins
-        .iter()
-        .map(|(id, g)| format!("{id}:{g:.3}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    match dif {
-        None if rc.token_ids.len() == rg.token_ids.len() => Ok(format!(
-            "MATCH 8/8 · cpu=[{}] gpu=[{}] · gaps=[{}]",
-            show(&rc.token_ids),
-            show(&rg.token_ids),
-            gaps
-        )),
-        _ => Ok(format!(
-            "DIF@{} · cpu=[{}] gpu=[{}] · gaps=[{}] (gap<0.05 en el flip = ruido; gap grande = bug)",
-            dif.map(|k| k.to_string()).unwrap_or("len".into()),
-            show(&rc.token_ids),
-            show(&rg.token_ids),
-            gaps
-        )),
-    }
-}
+
 
 pub fn unload() {
     if let Ok(mut g) = ENG.lock() {
         *g = None;
     }
+}
+
+/// Path del .cact cargado (para la paridad del api sin exponer el motor).
+pub(crate) fn cact_path() -> Result<String, String> {
+    let g = ENG.lock().map_err(|_| "mutex envenenado".to_string())?;
+    g.as_ref()
+        .ok_or_else(|| "motor GPU no cargado".to_string())
+        .map(|e| e.cact_path.clone())
 }
 
 pub fn is_loaded() -> bool {

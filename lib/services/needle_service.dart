@@ -6,7 +6,6 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 import '../src/rust/api/needle.dart' as rust;
-import '../src/rust/api/nengine.dart' as ng;
 
 /// Needle v2 on-device: descarga del .cact (13.7 MB), carga del motor
 /// y tool-calling local (query + tools JSON → llamada JSON).
@@ -55,9 +54,8 @@ class NeedleService extends ChangeNotifier {
 
   /// El motor Rust arranca sin modelo tras cada reinicio de la app,
   /// así que el estado real vive acá y se actualiza con load/unload.
+  /// (El motor GPU vive aparte en NeedleGpuService.)
   bool get loaded => _loadedV2;
-  bool _loadedGpu = false;
-  bool get loadedGpu => _loadedGpu;
   String? get modelPath => _modelPath;
 
   Future<String> get dirPath async {
@@ -124,65 +122,6 @@ class NeedleService extends ChangeNotifier {
     _loadedV2 = true;
     notifyListeners();
     return r;
-  }
-
-  /// Carga el mismo .cact en el motor GPU (forward WGSL, ~180 MB).
-  Future<String> loadGpu() async {
-    await refresh();
-    final p = _modelPath;
-    if (p == null) throw 'primero descargá el modelo (13.7 MB)';
-    final r = await ng.needleGpuLoad(path: p);
-    _loadedGpu = true;
-    notifyListeners();
-    return r;
-  }
-
-  /// Genera con el forward en GPU. Sin constrain en fase 1.
-  Future<NeedleOut> runGpu({
-    required String query,
-    required String toolsJson,
-    int maxNewTokens = 128,
-    double temperature = 0.0,
-    int seed = 0,
-  }) async {
-    final r = await ng.needleGpuRun(
-      query: query,
-      toolsJson: toolsJson,
-      maxNewTokens: maxNewTokens,
-      temperature: temperature,
-      seed: BigInt.from(seed),
-    );
-    return NeedleOut._fromRust(r);
-  }
-
-  void unloadGpu() {
-    ng.needleGpuUnload();
-    _loadedGpu = false;
-    notifyListeners();
-  }
-
-  /// Un solo paso cronometrado (diagnóstico cuelgue vs lentitud).
-  Future<String> gpuDiag() async => ng.needleGpuDiag();
-
-  /// Paridad CPU vs GPU en 8 tokens (detecta divergencia numérica).
-  Future<String> gpuParity(String query) async =>
-      ng.needleGpuParity(query: query);
-
-  /// Generación GPU en vivo: emite cada pieza de texto por el stream.
-  Stream<String> runGpuStream({
-    required String query,
-    required String toolsJson,
-    int maxNewTokens = 256,
-    double temperature = 0.0,
-    int seed = 0,
-  }) {
-    return ng.needleGpuRunStream(
-      query: query,
-      toolsJson: toolsJson,
-      maxNewTokens: maxNewTokens,
-      temperature: temperature,
-      seed: BigInt.from(seed),
-    );
   }
 
   Future<NeedleOut> run({
