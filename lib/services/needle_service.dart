@@ -25,7 +25,10 @@ class NeedleOut {
     required this.generatedTokens,
   });
 
-  static NeedleOut _fromRust(rust.NeedleOut o) => NeedleOut(
+  static NeedleOut _fromRust(rust.NeedleOut o) => NeedleOut.fromRust(o);
+
+  /// Conversión pública para el servicio GPU (mismo struct FRB).
+  static NeedleOut fromRust(rust.NeedleOut o) => NeedleOut(
         text: o.text,
         toolCall: o.toolCall,
         thinking: o.thinking,

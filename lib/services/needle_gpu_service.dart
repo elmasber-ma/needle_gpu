@@ -40,7 +40,7 @@ class NeedleGpuService extends ChangeNotifier {
       temperature: temperature,
       seed: BigInt.from(seed),
     );
-    return NeedleOut._fromRust(r);
+    return NeedleOut.fromRust(r);
   }
 
   /// Generación GPU en vivo: emite cada pieza de texto por el stream.
