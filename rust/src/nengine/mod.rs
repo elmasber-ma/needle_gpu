@@ -1346,8 +1346,8 @@ pub fn prompt_ids(query: &str, tools_json: &str) -> Result<Vec<u32>, String> {
 }
 
 /// Logits GPU paso a paso sobre `ids` (resetea el estado primero).
-/// Devuelve los logits de los últimos `tail` pasos.
-pub fn gpu_logits_stepped(ids: &[u32], tail: usize) -> Result<Vec<Vec<f32>>, String> {
+/// Devuelve los logits de TODOS los pasos (prefill + decode).
+pub fn gpu_logits_stepped(ids: &[u32]) -> Result<Vec<Vec<f32>>, String> {
     let mut g = ENG
         .lock()
         .map_err(|_| "mutex envenenado".to_string())?;
@@ -1367,16 +1367,12 @@ pub fn gpu_logits_stepped(ids: &[u32], tail: usize) -> Result<Vec<Vec<f32>>, Str
     eng.queue.write_buffer(&eng.act.lanes_a, 0, &z_l);
     eng.queue.write_buffer(&eng.act.lanes_b, 0, &z_l);
     eng.hist.extend_from_slice(ids);
-    let start = ids.len().saturating_sub(tail);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(ids.len());
     for (pos, &tok) in ids.iter().enumerate() {
         if pos >= eng.max_seq {
             return Err("contexto lleno".into());
         }
-        let lg = step_token(eng, tok, pos)?;
-        if pos >= start {
-            out.push(lg);
-        }
+        out.push(step_token(eng, tok, pos)?);
     }
     Ok(out)
 }

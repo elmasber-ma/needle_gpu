@@ -59,10 +59,10 @@ pub fn needle_gpu_parity(query: String) -> Result<String, String> {
             .unwrap_or(0)
     };
     // CPU stepped greedy: prompt + 8 (generate_sequential == generate).
+    // Se guardan TODOS los logits para comparar la trayectoria completa.
     let mut st = model.make_state();
     let mut seq = ids.clone();
     let mut clog: Vec<Vec<f32>> = Vec::new();
-    let mut ctok: Vec<u32> = Vec::new();
     let total = ids.len() + 8;
     for pos in 0..total {
         let tok = *seq.get(pos).ok_or("secuencia corta")?;
@@ -70,23 +70,26 @@ pub fn needle_gpu_parity(query: String) -> Result<String, String> {
         model
             .step(tok, &mut st, &mut lg)
             .map_err(|e| format!("cpu step {pos}: {e}"))?;
-        // Alineado con la GPU (últimos 8 = pos P..P+7): el argmax del paso
-        // P-1 alimenta el paso P, pero sus logits no se comparan.
-        if pos + 1 >= ids.len() {
-            let best = argmax(&lg);
-            if pos >= ids.len() && clog.len() < 8 {
-                ctok.push(best);
-                clog.push(lg);
-            }
-            if pos + 1 < total {
-                seq.push(best);
-            }
+        if pos + 1 >= ids.len() && pos + 1 < total {
+            seq.push(argmax(&lg));
         }
+        clog.push(lg);
     }
-    // GPU sobre la misma secuencia; últimos 8 logits.
-    let glog = nengine::gpu_logits_stepped(&seq, 8)?;
-    if glog.len() != 8 {
+    // GPU sobre la misma secuencia, trayectoria completa.
+    let glog = nengine::gpu_logits_stepped(&seq)?;
+    if glog.len() != clog.len() {
         return Err(format!("gpu devolvió {} logits", glog.len()));
+    }
+    let vmax = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let p = ids.len();
+    let mut pmax = 0.0f32;
+    for k in 0..p {
+        pmax = pmax.max(vmax(&clog[k], &glog[k]));
     }
     let show = |v: &[u32]| {
         v.iter()
@@ -94,18 +97,15 @@ pub fn needle_gpu_parity(query: String) -> Result<String, String> {
             .collect::<Vec<_>>()
             .join(",")
     };
-    let gtok: Vec<u32> = glog.iter().map(|lg| argmax(lg)).collect();
+    let ctok: Vec<u32> = clog[p..].iter().map(|lg| argmax(lg)).collect();
+    let gtok: Vec<u32> = glog[p..].iter().map(|lg| argmax(lg)).collect();
     let mut dif = None;
     let mut dmax = Vec::with_capacity(8);
     for k in 0..8 {
         if ctok[k] != gtok[k] && dif.is_none() {
             dif = Some(k);
         }
-        let mut m = 0.0f32;
-        for (a, b) in clog[k].iter().zip(glog[k].iter()) {
-            m = m.max((a - b).abs());
-        }
-        dmax.push(m);
+        dmax.push(vmax(&clog[p + k], &glog[p + k]));
     }
     let ds = dmax
         .iter()
@@ -114,13 +114,13 @@ pub fn needle_gpu_parity(query: String) -> Result<String, String> {
         .join(" ");
     match dif {
         None => Ok(format!(
-            "MATCH 8/8 · cpu=[{}] gpu=[{}] · dmax=[{}] (<0.5 = ruido)",
+            "MATCH 8/8 · cpu=[{}] gpu=[{}] · pmax={pmax:.3} dmax=[{}] (<0.5 = ruido)",
             show(&ctok),
             show(&gtok),
             ds
         )),
         Some(k) => Ok(format!(
-            "DIF@{k} · cpu=[{}] gpu=[{}] · dmax=[{}] (dmax<0.5 = ruido; grande = bug)",
+            "DIF@{k} · cpu=[{}] gpu=[{}] · pmax={pmax:.3} dmax=[{}] (dmax<0.5 = ruido; grande = bug)",
             show(&ctok),
             show(&gtok),
             ds

@@ -184,7 +184,8 @@ fn cq_matvec(@builtin(global_invocation_id) id: vec3<u32>) {
           if (cqm_p.is_ternary == 1u) {
             if (code == 3u) { idx = 0u; }
             else if (code == 0u) { idx = 1u; }
-            else { idx = 2u; }
+            else if (code == 1u) { idx = 2u; }
+            else { idx = 1u; }
           }
           vals[t * P + k] = cqm_lv[idx];
         }
@@ -206,7 +207,8 @@ fn cq_matvec(@builtin(global_invocation_id) id: vec3<u32>) {
         if (cqm_p.is_ternary == 1u) {
           if (code == 3u) { idx = 0u; }
           else if (code == 0u) { idx = 1u; }
-          else { idx = 2u; }
+          else if (code == 1u) { idx = 2u; }
+          else { idx = 1u; }
         }
         acc += cqm_lv[idx] * cqm_xh[gx_base + b * P + k];
       }
