@@ -1346,9 +1346,42 @@ fn sweep_all(eng: &Engine) -> Result<String, String> {
         .take(10)
         .map(|(nm, dm)| format!("{nm}:{dm:.2}"))
         .collect();
+    // máximo por tipo de proyección (cabe en el chat y dice QUÉ clase falla)
+    let mut kind: std::collections::HashMap<String, f32> = [
+        "emb", "q", "k", "v", "g", "o", "pp", "po", "pr", "ek", "ev",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), 0.0f32))
+    .collect();
+    for (nm, dm) in worst.iter() {
+        let key = if nm.starts_with("pp") {
+            "pp"
+        } else if nm.starts_with("po") {
+            "po"
+        } else if nm.starts_with("pr") {
+            "pr"
+        } else if nm.starts_with("ek") {
+            "ek"
+        } else if nm.starts_with("ev") {
+            "ev"
+        } else if nm == "emb" {
+            "emb"
+        } else {
+            &nm[..1]
+        };
+        if let Some(e) = kind.get_mut(key) {
+            *e = e.max(*dm);
+        }
+    }
+    let mut ks: Vec<String> = kind
+        .iter()
+        .map(|(k, v)| format!("{k}:{v:.2}"))
+        .collect();
+    ks.sort();
     Ok(format!(
-        "sweep n={n} maxΔ={gmax:.5} mal=[{}]",
-        mal.join(" ")
+        "sweep n={n} maxΔ={gmax:.5} mal=[{}] kind=[{}]",
+        mal.join(" "),
+        ks.join(" ")
     ))
 }
 
