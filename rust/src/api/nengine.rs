@@ -33,6 +33,12 @@ pub fn needle_gpu_diag() -> Result<String, String> {
     nengine::diag_step()
 }
 
+/// Paridad CPU vs GPU en 8 tokens greedy (detecta divergencia numérica).
+#[flutter_rust_bridge::frb(sync)]
+pub fn needle_gpu_parity(query: String) -> Result<String, String> {
+    nengine::parity(&query)
+}
+
 /// Genera con el forward en GPU, emitiendo cada pieza en vivo.
 /// Sin constrain en fase 1.
 #[flutter_rust_bridge::frb]

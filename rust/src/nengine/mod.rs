@@ -111,6 +111,7 @@ struct Act {
 }
 
 struct Engine {
+    cact_path: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipes: HashMap<&'static str, wgpu::ComputePipeline>,
@@ -567,6 +568,7 @@ pub async fn load(path: &str) -> Result<String, String> {
     // STORAGE aunque el kernel no lo lea: si no, validación).
     let dummy1 = sbuf(&device, &[0u8; 4]);
     let eng = Engine {
+        cact_path: path.to_string(),
         device,
         queue,
         pipes,
@@ -1009,6 +1011,7 @@ pub struct GenOut {
     pub stop: String,
     pub prompt_tokens: u32,
     pub generated_tokens: u32,
+    pub token_ids: Vec<u32>,
 }
 
 /// Un solo paso cronometrado (diagnóstico: cuelga vs lento).
@@ -1131,7 +1134,60 @@ fn generate_inner(
         stop: stop.to_string(),
         prompt_tokens: ids.len() as u32,
         generated_tokens: gen.len() as u32,
+        token_ids: gen,
     })
+}
+
+/// Paridad CPU vs GPU: mismos 8 tokens greedy, compara id por id.
+/// Carga un motor CPU temporal con el mismo .cact (no toca el GPU).
+pub fn parity(query: &str) -> Result<String, String> {
+    let cact_path = {
+        let g = ENG
+            .lock()
+            .map_err(|_| "mutex envenenado".to_string())?;
+        g.as_ref().ok_or("motor GPU no cargado")?.cact_path.clone()
+    };
+    use needle_infer::v2_engine::{GenerateOptions, V2Engine};
+    let cpu = V2Engine::load(std::path::Path::new(cact_path))
+        .map_err(|e| format!("cpu load: {e}"))?;
+    let opts = GenerateOptions {
+        max_new_tokens: 8,
+        temperature: 0.0,
+        seed: 0,
+        system: None,
+        prefill_chunk: 128,
+        constrain: false,
+    };
+    let rc = cpu.generate(query, "[]", &opts, |_, _| {});
+    let rg = generate_inner(query, "[]", 8, 0.0, 0, &mut |_| {})?;
+    let n = rc.token_ids.len().min(rg.token_ids.len()).min(8);
+    let mut dif = None;
+    for k in 0..n {
+        if rc.token_ids[k] != rg.token_ids[k] {
+            dif = Some(k);
+            break;
+        }
+    }
+    let show = |v: &[u32]| {
+        v.iter()
+            .take(8)
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    match dif {
+        None if rc.token_ids.len() == rg.token_ids.len() => Ok(format!(
+            "MATCH 8/8 · cpu=[{}] gpu=[{}]",
+            show(&rc.token_ids),
+            show(&rg.token_ids)
+        )),
+        _ => Ok(format!(
+            "DIF@{} · cpu=[{}] gpu=[{}]",
+            dif.map(|k| k.to_string()).unwrap_or("len".into()),
+            show(&rc.token_ids),
+            show(&rg.token_ids)
+        )),
+    }
 }
 
 pub fn unload() {

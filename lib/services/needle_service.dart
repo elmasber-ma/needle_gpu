@@ -164,6 +164,10 @@ class NeedleService extends ChangeNotifier {
   /// Un solo paso cronometrado (diagnóstico cuelgue vs lentitud).
   Future<String> gpuDiag() async => ng.needleGpuDiag();
 
+  /// Paridad CPU vs GPU en 8 tokens (detecta divergencia numérica).
+  Future<String> gpuParity(String query) async =>
+      ng.needleGpuParity(query: query);
+
   /// Generación GPU en vivo: emite cada pieza de texto por el stream.
   Stream<String> runGpuStream({
     required String query,

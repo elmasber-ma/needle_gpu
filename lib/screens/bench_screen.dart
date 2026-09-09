@@ -142,10 +142,40 @@ class _BenchScreenState extends State<BenchScreen> {
         const ModelCard(),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10),
-          child: FilledButton.icon(
-            onPressed: _busy ? null : _correr,
-            icon: const Icon(Icons.speed_rounded, size: 18),
-            label: const Text('Correr benchmark'),
+          child: Wrap(
+            spacing: 8,
+            children: [
+              FilledButton.icon(
+                onPressed: _busy ? null : _correr,
+                icon: const Icon(Icons.speed_rounded, size: 18),
+                label: const Text('Correr benchmark'),
+              ),
+              OutlinedButton.icon(
+                onPressed: (_busy || !_svc.loadedGpu)
+                    ? null
+                    : () async {
+                        setState(() => _busy = true);
+                        try {
+                          final r =
+                              await _svc.gpuParity('Hola');
+                          if (mounted) {
+                            setState(() =>
+                                _filas.insert(0, _Fila('Paridad', r)));
+                          }
+                        } catch (e) {
+                          if (mounted) {
+                            setState(() => _filas.insert(
+                                0, _Fila('Paridad ERROR', '$e')));
+                          }
+                        } finally {
+                          if (mounted) setState(() => _busy = false);
+                        }
+                      },
+                icon: const Icon(Icons.compare_arrows_rounded, size: 18),
+                label: const Text('Paridad CPU/GPU',
+                    style: TextStyle(fontSize: 12)),
+              ),
+            ],
           ),
         ),
         if (_busy)

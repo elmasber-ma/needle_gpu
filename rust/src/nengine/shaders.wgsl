@@ -100,6 +100,93 @@ fn rope(@builtin(global_invocation_id) id: vec3<u32>) {
   rp_b[h * 64u + 32u + i] = b * c + a * s;
 }
 
+// ---------------------------------------------------------------- CQ prepare
+// xh = FWHT128 por grupo de x (zero-pad más allá de in_feat).
+// Un workgroup (128 hilos) por grupo.
+struct CqpP { in_feat: u32, ngroups: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read_write> cqp_xh: array<f32>; // [ngroups*128]
+@group(0) @binding(1) var<storage, read> cqp_x: array<f32>;
+@group(0) @binding(2) var<uniform> cqp_p: CqpP;
+var<workgroup> cqp_s: array<f32, 128>;
+@compute @workgroup_size(128)
+fn cq_prepare(
+  @builtin(workgroup_id) wg: vec3<u32>,
+  @builtin(local_invocation_id) li: vec3<u32>
+) {
+  let g = wg.x;
+  if (g >= cqp_p.ngroups) { return; }
+  let t = li.x;
+  let src = g * 128u + t;
+  cqp_s[t] = select(0.0, cqp_x[src], src < cqp_p.in_feat);
+  workgroupBarrier();
+  var s = 0u;
+  while (s < 7u) {
+    let stride = 1u << s;
+    let base = (t / stride) * (stride * 2u);
+    let i0 = base + (t % stride);
+    let i1 = i0 + stride;
+    let a = cqp_s[i0];
+    let b = cqp_s[i1];
+    cqp_s[i0] = (a + b) * 0.70710678;
+    cqp_s[i1] = (a - b) * 0.70710678;
+    workgroupBarrier();
+    s += 1u;
+  }
+  cqp_xh[g * 128u + t] = cqp_s[t];
+}
+
+// ---------------------------------------------------------------- CQ matvec
+// y[row_start..] = W_cq @ xh ; W en bits LSB-first, niveles+normas f32.
+// Un hilo por fila.
+struct CqmP {
+  rows: u32, row_start: u32, ngroups: u32, group: u32,
+  bits: u32, row_u32: u32, is_ternary: u32, nlevels: u32,
+};
+@group(0) @binding(0) var<storage, read_write> cqm_y: array<f32>;
+@group(0) @binding(1) var<storage, read> cqm_packed: array<u32>;
+@group(0) @binding(2) var<storage, read> cqm_norms: array<f32>; // [out*ngroups]
+@group(0) @binding(3) var<storage, read> cqm_xh: array<f32>;
+@group(0) @binding(4) var<storage, read> cqm_lv: array<f32>;
+@group(0) @binding(5) var<uniform> cqm_p: CqmP;
+@compute @workgroup_size(64)
+fn cq_matvec(@builtin(global_invocation_id) id: vec3<u32>) {
+  let r = id.x;
+  if (r >= cqm_p.rows) { return; }
+  let row = cqm_p.row_start + r;
+  let bits = cqm_p.bits;
+  let group = cqm_p.group;
+  let mask = (1u << bits) - 1u;
+  var total: f32 = 0.0;
+  var g = 0u;
+  while (g < cqm_p.ngroups) {
+    let norm = cqm_norms[row * cqm_p.ngroups + g];
+    var acc: f32 = 0.0;
+    var k = 0u;
+    while (k < group) {
+      let bitpos = (g * group + k) * bits;
+      let word = bitpos / 32u;
+      let shift = bitpos % 32u;
+      let base = (row * cqm_p.row_u32 + word);
+      var code = (cqm_packed[base] >> shift) & mask;
+      if (shift + bits > 32u) {
+        let lo = 32u - shift;
+        code = code | ((cqm_packed[base + 1u] & ((1u << (bits - lo)) - 1u)) << lo);
+      }
+      var idx = code;
+      if (cqm_p.is_ternary == 1u) {
+        if (code == 3u) { idx = 0u; }
+        else if (code == 0u) { idx = 1u; }
+        else { idx = 2u; }
+      }
+      acc += cqm_lv[idx] * cqm_xh[g * group + k];
+      k += 1u;
+    }
+    total += norm * acc;
+    g += 1u;
+  }
+  cqm_y[r] = total;
+}
+
 // ---------------------------------------------------------------- KV write
 // K[slot*256..] = k[0..256], V igual. Un dispatch por capa.
 struct KvP { slot: u32, _p0: u32, _p1: u32, _p2: u32 };
