@@ -43,7 +43,7 @@ class HomeTabs extends StatelessWidget {
           ),
         ),
         body: const TabBarView(
-          children [
+          children: [
             ChatCpuScreen(),
             GpuScreen(),
             BenchScreen(),

@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 import '../src/rust/api/needle.dart' as rust;
+import '../src/rust/api/nengine.dart' as ng;
 
 /// Needle v2 on-device: descarga del .cact (13.7 MB), carga del motor
 /// y tool-calling local (query + tools JSON → llamada JSON).
@@ -130,7 +131,7 @@ class NeedleService extends ChangeNotifier {
     await refresh();
     final p = _modelPath;
     if (p == null) throw 'primero descargá el modelo (13.7 MB)';
-    final r = await rust.needleGpuLoad(path: p);
+    final r = await ng.needleGpuLoad(path: p);
     _loadedGpu = true;
     notifyListeners();
     return r;
@@ -144,7 +145,7 @@ class NeedleService extends ChangeNotifier {
     double temperature = 0.0,
     int seed = 0,
   }) async {
-    final r = await rust.needleGpuRun(
+    final r = await ng.needleGpuRun(
       query: query,
       toolsJson: toolsJson,
       maxNewTokens: maxNewTokens,
@@ -155,7 +156,7 @@ class NeedleService extends ChangeNotifier {
   }
 
   void unloadGpu() {
-    rust.needleGpuUnload();
+    ng.needleGpuUnload();
     _loadedGpu = false;
     notifyListeners();
   }
