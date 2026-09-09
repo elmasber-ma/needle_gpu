@@ -162,7 +162,7 @@ class NeedleService extends ChangeNotifier {
   }
 
   /// Un solo paso cronometrado (diagnóstico cuelgue vs lentitud).
-  Future<String> gpuDiag() => ng.needleGpuDiag();
+  Future<String> gpuDiag() async => ng.needleGpuDiag();
 
   /// Generación GPU en vivo: emite cada pieza de texto por el stream.
   Stream<String> runGpuStream({
