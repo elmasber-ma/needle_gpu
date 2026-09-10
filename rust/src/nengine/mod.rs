@@ -1262,6 +1262,26 @@ fn sweep_one(
         }
         y_cpu[o] = acc;
     }
+    // referencia needle-core oficial (mismo x): aísla mi slice/shader.
+    // d_nc = |nc - gpu|; si d_nc≈0 pero d_cpu grande, miente mi get_f32.
+    let mut d_nc = -1.0f32;
+    if rec_is_cq(cact, idx) {
+        if let Ok(w) = cact.cq(idx).map_err(|_| "cq".to_string()) {
+            if w.in_feat == x.len() {
+                let mut xh_nc = vec![0.0f32; w.in_padded];
+                w.prepare_input(x, &mut xh_nc);
+                let mut y_nc = vec![0.0f32; rows as usize];
+                w.matvec_rows_prepared(&xh_nc, rs, &mut y_nc);
+                // se compara contra y_gpu más abajo; guardo en y_cpu2 vía dm extra
+                d_nc = 0.0;
+                for (a, b) in y_nc.iter().zip(y_cpu.iter()) {
+                    d_nc = d_nc.max((a - b).abs());
+                }
+                // d_nc aquí = |nc - cpu| (chequeo de mi referencia)
+                let _ = &y_nc;
+            }
+        }
+    }
     // GPU: misma x por prepare+proj, salida a logits, readback
     let a = &eng.act;
     let (xbuf, xh) = if in_feat == 2048 {

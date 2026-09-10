@@ -119,16 +119,20 @@ fn cq_prepare(
   let src = g * 128u + t;
   cqp_s[t] = select(0.0, cqp_x[src], src < cqp_p.in_feat);
   workgroupBarrier();
+  // OJO: 64 pares por etapa, 128 hilos: solo t<64 calcula (el resto espera
+  // en la barrera). Sin el guard, t>=64 lee/escribe fuera del array.
   var s = 0u;
   while (s < 7u) {
-    let stride = 1u << s;
-    let base = (t / stride) * (stride * 2u);
-    let i0 = base + (t % stride);
-    let i1 = i0 + stride;
-    let a = cqp_s[i0];
-    let b = cqp_s[i1];
-    cqp_s[i0] = (a + b) * 0.70710678;
-    cqp_s[i1] = (a - b) * 0.70710678;
+    if (t < 64u) {
+      let stride = 1u << s;
+      let base = (t / stride) * (stride * 2u);
+      let i0 = base + (t % stride);
+      let i1 = i0 + stride;
+      let a = cqp_s[i0];
+      let b = cqp_s[i1];
+      cqp_s[i0] = (a + b) * 0.70710678;
+      cqp_s[i1] = (a - b) * 0.70710678;
+    }
     workgroupBarrier();
     s += 1u;
   }
@@ -449,6 +453,7 @@ fn fwht(@builtin(local_invocation_id) li: vec3<u32>) {
   fw_s[t] = fw_b[t];
   fw_s[t + 256u] = fw_b[t + 256u];
   workgroupBarrier();
+  // 256 hilos, 256 pares por etapa: t<->par es biyectivo, todos calculan.
   var s = 0u;
   while (s < 9u) {
     let stride = 1u << s;
