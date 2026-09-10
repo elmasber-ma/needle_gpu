@@ -137,7 +137,6 @@ pub(crate) struct Act {
     pub(crate) xh_e: wgpu::Buffer,
     pub(crate) xh_nx: wgpu::Buffer,
     pub(crate) xh_lm: wgpu::Buffer,
-    pub(crate) snap: wgpu::Buffer,
 }
 
 pub(crate) struct Engine {
@@ -174,6 +173,4 @@ pub(crate) struct Engine {
     pub(crate) engram_dil: usize,
     pub(crate) engram_slots: usize,
     pub(crate) vring_n: usize,
-    /// Si es Some(n), el forward corre solo las primeras n capas (ladder).
-    pub(crate) stop_after: Option<usize>,
 }
