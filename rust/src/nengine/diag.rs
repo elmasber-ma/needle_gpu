@@ -262,7 +262,7 @@ pub(crate) fn sweep_kb(eng: &Engine) -> Result<String, String> {
             d_attn = d_attn.max((yo[h * 64 + d] - want).abs());
         }
     }
-    Ok(format(
+    Ok(format!(
         "kb=[rms:{d_rms:.5} rope:{d_rope:.5} kv:{d_kv:.5} attn:{d_attn:.5}]"
     ))
 }
