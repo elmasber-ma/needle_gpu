@@ -88,8 +88,13 @@ pub fn needle_gpu_parity(query: String) -> Result<String, String> {
     };
     let p = ids.len();
     let mut pmax = 0.0f32;
+    let mut pfirst = Vec::new();
     for k in 0..p {
-        pmax = pmax.max(vmax(&clog[k], &glog[k]));
+        let m = vmax(&clog[k], &glog[k]);
+        pmax = pmax.max(m);
+        if k < 6 {
+            pfirst.push(format!("{m:.3}"));
+        }
     }
     let show = |v: &[u32]| {
         v.iter()
@@ -114,15 +119,17 @@ pub fn needle_gpu_parity(query: String) -> Result<String, String> {
         .join(" ");
     match dif {
         None => Ok(format!(
-            "MATCH 8/8 · cpu=[{}] gpu=[{}] · pmax={pmax:.3} dmax=[{}] (<0.5 = ruido)",
+            "MATCH 8/8 · cpu=[{}] gpu=[{}] · p0=[{}] pmax={pmax:.3} dmax=[{}] (<0.5 = ruido)",
             show(&ctok),
             show(&gtok),
+            pfirst.join(" "),
             ds
         )),
         Some(k) => Ok(format!(
-            "DIF@{k} · cpu=[{}] gpu=[{}] · pmax={pmax:.3} dmax=[{}] (dmax<0.5 = ruido; grande = bug)",
+            "DIF@{k} · cpu=[{}] gpu=[{}] · p0=[{}] pmax={pmax:.3} dmax=[{}] (dmax<0.5 = ruido; grande = bug)",
             show(&ctok),
             show(&gtok),
+            pfirst.join(" "),
             ds
         )),
     }
