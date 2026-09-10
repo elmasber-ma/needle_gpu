@@ -49,15 +49,25 @@ fn rms_norm(@builtin(local_invocation_id) li: vec3<u32>) {
 @compute @workgroup_size(64)
 fn rms_heads(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x;
-  if (i >= rh_n.x) { return; }
-  let base = (i / 64u) * 64u;
+  let n = rh_n.x;
+  // OJO: cada hilo suma TODA su cabeza (64 lecturas) pero escribe UN
+  // elemento. Sin barrera, un hilo escribe mientras otro todavía suma:
+  // race condition. La barrera separa lectura de escritura.
+  // (Los hilos fuera de rango igual participan de la barrera: sin
+  // returns tempranos antes de ella.)
   var s: f32 = 0.0;
-  for (var j = 0u; j < 64u; j++) {
-    let v = rh_x[base + j];
-    s += v * v;
+  if (i < n) {
+    let base = (i / 64u) * 64u;
+    for (var j = 0u; j < 64u; j++) {
+      let v = rh_x[base + j];
+      s += v * v;
+    }
   }
-  let inv = inverseSqrt(s / 64.0 + 0.000001);
-  rh_x[i] = (1.0 + rh_g[i % 64u]) * rh_x[i] * inv;
+  workgroupBarrier();
+  if (i < n) {
+    let inv = inverseSqrt(s / 64.0 + 0.000001);
+    rh_x[i] = (1.0 + rh_g[i % 64u]) * rh_x[i] * inv;
+  }
 }
 
 // ---------------------------------------------------------------- matvec
