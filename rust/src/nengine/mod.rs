@@ -1300,6 +1300,63 @@ fn sweep_one(
     Ok((name.to_string(), dm))
 }
 
+/// Compara la rotación Hadamard (prepare) GPU vs la oficial de needle-core.
+/// Devuelve Δmax. Si esto da ~0, el prepare está bien y el bug es decode.
+fn sweep_prep(
+    eng: &Engine,
+    cact: &Cact,
+    idx: usize,
+    x: &[f32],
+) -> Result<f32, String> {
+    let w: needle_core::cq::CqWeight =
+        cact.cq(idx).map_err(|e| format!("cq: {e}"))?;
+    let mut xh_cpu = vec![0.0f32; w.in_padded];
+    w.prepare_input(x, &mut xh_cpu);
+    let a = &eng.act;
+    let (xbuf, xh) = if x.len() == 2048 {
+        (&a.nx, &a.xh_nx)
+    } else {
+        (&a.h, &a.xh_h)
+    };
+    eng.queue.write_buffer(xbuf, 0, &f32s(x));
+    let mut enc = eng
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    eng.prepare(&mut enc, xh, xbuf, x.len() as u32);
+    let n = xh_cpu.len();
+    enc.copy_buffer_to_buffer(xh, 0, &eng.staging, 0, (n * 4) as u64);
+    eng.queue.submit(Some(enc.finish()));
+    let slice = eng.staging.slice(..(n * 4) as u64);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    eng.device.poll(wgpu::PollType::wait()).expect("poll");
+    rx.recv()
+        .map_err(|_| "readback roto".to_string())?
+        .map_err(|e| format!("map: {e:?}"))?;
+    let data = slice.get_mapped_range();
+    let mut dm = 0.0f32;
+    for (i, ch) in data.chunks_exact(4).enumerate() {
+        if i >= n {
+            break;
+        }
+        let v = f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+        dm = dm.max((v - xh_cpu[i]).abs());
+    }
+    drop(data);
+    eng.staging.unmap();
+    Ok(dm)
+}
+
+/// Extrae (idx .cact) de un Wmat.
+fn widx(w: &Wmat) -> usize {
+    match w {
+        Wmat::F32 { idx, .. } => *idx,
+        Wmat::Cq(c) => c.idx,
+    }
+}
+
 /// Corre todas las proyecciones del motor contra los pesos reales.
 /// Aísla un bug de prepare/matvec del resto del forward.
 fn sweep_all(eng: &Engine) -> Result<String, String> {
@@ -1378,8 +1435,12 @@ fn sweep_all(eng: &Engine) -> Result<String, String> {
         .map(|(k, v)| format!("{k}:{v:.2}"))
         .collect();
     ks.sort();
+    // prepare 512 (q0) y 2048 (pp0) contra needle-core
+    let p512 = sweep_prep(eng, &cact, widx(&eng.layers[0].q), &x512).unwrap_or(-1.0);
+    let p2048 =
+        sweep_prep(eng, &cact, widx(&eng.layers[0].phi_pre), &x2048).unwrap_or(-1.0);
     Ok(format!(
-        "sweep n={n} maxΔ={gmax:.5} mal=[{}] kind=[{}]",
+        "sweep n={n} maxΔ={gmax:.5} mal=[{}] kind=[{}] prep=[512:{p512:.5} 2048:{p2048:.5}]",
         mal.join(" "),
         ks.join(" ")
     ))
