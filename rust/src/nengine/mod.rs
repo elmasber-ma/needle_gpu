@@ -1265,7 +1265,7 @@ fn sweep_one(
     // referencia needle-core oficial (mismo x): aísla mi slice/shader.
     // d_nc = |nc - gpu|; si d_nc≈0 pero d_cpu grande, miente mi get_f32.
     let mut d_nc = -1.0f32;
-    if rec_is_cq(cact, idx) {
+    if cact.record(idx).dtype == DT_CQ {
         if let Ok(w) = cact.cq(idx).map_err(|_| "cq".to_string()) {
             if w.in_feat == x.len() {
                 let mut xh_nc = vec![0.0f32; w.in_padded];
