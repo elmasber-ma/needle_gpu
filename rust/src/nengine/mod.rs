@@ -1369,6 +1369,161 @@ fn sweep_prep(
     Ok(dm)
 }
 
+/// Lee `n` floats de un buffer storage vía staging (1 submit).
+fn read_storage(eng: &Engine, buf: &wgpu::Buffer, n: usize) -> Result<Vec<f32>, String> {
+    let mut enc = eng
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    enc.copy_buffer_to_buffer(buf, 0, &eng.staging, 0, (n * 4) as u64);
+    eng.queue.submit(Some(enc.finish()));
+    let slice = eng.staging.slice(..(n * 4) as u64);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    eng.device.poll(wgpu::PollType::wait()).expect("poll");
+    rx.recv()
+        .map_err(|_| "readback roto".to_string())?
+        .map_err(|e| format!("map: {e:?}"))?;
+    let data = slice.get_mapped_range();
+    let mut out = vec![0.0f32; n];
+    for (i, ch) in data.chunks_exact(4).enumerate() {
+        if i >= n {
+            break;
+        }
+        out[i] = f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+    }
+    drop(data);
+    eng.staging.unmap();
+    Ok(out)
+}
+
+/// Tests unitarios de lo que el sweep no cubre: rms_heads, rope y
+/// kv_write+attention. El paso 0 es exacto y el 1 diverge: lo único que
+/// viaja entre pasos es el KV-cache, así que el bug vive acá.
+fn sweep_kb(eng: &Engine) -> Result<String, String> {
+    let mut s = 0xABCDEF01u32;
+    let mut rnd = || {
+        s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        (s >> 8) as f32 / 16777216.0 - 0.5
+    };
+    let a = &eng.act;
+    let l = &eng.layers[0];
+    let mut enc = eng
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+    // A: rms_heads sobre a.q con gamma=q_norm de l0
+    let x: Vec<f32> = (0..512).map(|_| rnd()).collect();
+    eng.queue.write_buffer(&a.q, 0, &f32s(&x));
+    let g = read_storage(eng, &l.qn, 64)?;
+    let u = eng.ub(&u16f(512, 0, 0, 0));
+    eng.run(&mut enc, "rms_heads", &[&a.q, &l.qn, &u], div64(512));
+    eng.queue.submit(Some(enc.finish()));
+    let yq = read_storage(eng, &a.q, 512)?;
+    let mut d_rms = 0.0f32;
+    for i in 0..512 {
+        let base = (i / 64) * 64;
+        let mut ss = 0.0f32;
+        for j in 0..64 {
+            ss += x[base + j] * x[base + j];
+        }
+        let want = (1.0 + g[i % 64]) * x[i] / (ss / 64.0 + 1e-6).sqrt();
+        d_rms = d_rms.max((yq[i] - want).abs());
+    }
+
+    // B: rope sobre a.q (8 heads), pos=3
+    let x2: Vec<f32> = (0..512).map(|_| rnd()).collect();
+    eng.queue.write_buffer(&a.q, 0, &f32s(&x2));
+    let mut enc = eng
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let u = eng.ub(&u16f(3, 8, 0, 0));
+    eng.run(&mut enc, "rope", &[&a.q, &eng.rope, &u], div64(8 * 32));
+    eng.queue.submit(Some(enc.finish()));
+    let yq2 = read_storage(eng, &a.q, 512)?;
+    let mut d_rope = 0.0f32;
+    for h in 0..8 {
+        for i in 0..32 {
+            let ang = 3.0 / eng.rope_theta.powf(2.0 * i as f32 / 64.0);
+            let (c, sn) = (ang.cos(), ang.sin());
+            let (a0, b0) = (x2[h * 64 + i], x2[h * 64 + 32 + i]);
+            d_rope = d_rope.max((yq2[h * 64 + i] - (a0 * c - b0 * sn)).abs());
+            d_rope = d_rope.max((yq2[h * 64 + 32 + i] - (b0 * c + a0 * sn)).abs());
+        }
+    }
+
+    // C: kv_write (slot 1 vía kernel) + attention pos=1, lo=0
+    let k0: Vec<f32> = (0..256).map(|_| rnd()).collect();
+    let k1: Vec<f32> = (0..256).map(|_| rnd()).collect();
+    let v0: Vec<f32> = (0..256).map(|_| rnd()).collect();
+    let v1: Vec<f32> = (0..256).map(|_| rnd()).collect();
+    let q: Vec<f32> = (0..512).map(|_| rnd()).collect();
+    eng.queue.write_buffer(&l.kv_k, 0, &f32s(&k0));
+    eng.queue.write_buffer(&l.kv_v, 0, &f32s(&v0));
+    eng.queue.write_buffer(&l.kv_v, (256 * 4) as u64, &f32s(&v1));
+    eng.queue.write_buffer(&a.q, 0, &f32s(&q));
+    eng.queue.write_buffer(&a.k, 0, &f32s(&k1));
+    let mut enc = eng
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let u = eng.ub(&u16f(1, 0, 0, 0));
+    eng.run(
+        &mut enc,
+        "kv_write",
+        &[&a.k, &a.v, &l.kv_k, &l.kv_v, &u],
+        div64(256),
+    );
+    // OJO: kv_write también escribe V desde a.v (basura de tests previos);
+    // reescribo el slot 1 de V directo para aislar attention.
+    eng.queue.submit(Some(enc.finish()));
+    eng.queue.write_buffer(&l.kv_v, (256 * 4) as u64, &f32s(&v1));
+    let mut enc = eng
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let mut v = Vec::with_capacity(16);
+    v.extend_from_slice(&1u32.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend_from_slice(&INV_SQRT_HEAD.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    let u = eng.ub(&v);
+    eng.run(&mut enc, "attn", &[&a.q, &l.kv_k, &l.kv_v, &a.o, &u], 8);
+    eng.queue.submit(Some(enc.finish()));
+    let yo = read_storage(eng, &a.o, 512)?;
+    // kv_write check: slot 1 de K debe ser k1
+    let kk = read_storage(eng, &l.kv_k, 512)?;
+    let mut d_kv = 0.0f32;
+    for i in 0..256 {
+        d_kv = d_kv.max((kk[i] - k0[i]).abs());
+        d_kv = d_kv.max((kk[256 + i] - k1[i]).abs());
+    }
+    // referencia attention CPU
+    let mut d_attn = 0.0f32;
+    for h in 0..8 {
+        let kv = h / 2;
+        let mut sc = [0.0f32; 2];
+        for t in 0..2 {
+            let k = if t == 0 { &k0 } else { &k1 };
+            let mut acc = 0.0f32;
+            for d in 0..64 {
+                acc += q[h * 64 + d] * k[kv * 64 + d];
+            }
+            sc[t] = acc * 0.125;
+        }
+        let m = sc[0].max(sc[1]);
+        let e0 = (sc[0] - m).exp();
+        let e1 = (sc[1] - m).exp();
+        let (w0, w1) = (e0 / (e0 + e1), e1 / (e0 + e1));
+        for d in 0..64 {
+            let want = w0 * v0[kv * 64 + d] + w1 * v1[kv * 64 + d];
+            d_attn = d_attn.max((yo[h * 64 + d] - want).abs());
+        }
+    }
+    Ok(format(
+        "kb=[rms:{d_rms:.5} rope:{d_rope:.5} kv:{d_kv:.5} attn:{d_attn:.5}]"
+    ))
+}
+
 /// Extrae (idx .cact) de un Wmat.
 fn widx(w: &Wmat) -> usize {
     match w {
@@ -1579,7 +1734,8 @@ pub fn diag_step() -> Result<String, String> {
         eng.vocab, eng.n_layers
     );
     let sw = sweep_all(eng)?;
-    Ok(format!("{step_s} · {sw}"))
+    let kb = sweep_kb(eng)?;
+    Ok(format!("{step_s} · {sw} · {kb}"))
 }
 
 /// IDs del prompt (diagnóstico de paridad): mismo prompt que generate.
